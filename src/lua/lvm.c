@@ -40,9 +40,31 @@ const TValue *luaV_tonumber (const TValue *obj, TValue *n) {
     setnvalue(n, num);
     return n;
   }
-  else
-    return NULL;
+
+  /* --- PICO-8 互換パッチ: nil / boolean を 0, 1 に変換 --- */
+  if (ttisnil(obj)) {
+    setnvalue(n, 0);
+    return n;
+  }
+  if (ttisboolean(obj)) {
+    setnvalue(n, bvalue(obj) ? 1 : 0);
+    return n;
+  }
+
+  /* --- 追加パッチ: function / table に対する算術演算を 0 として安全に続行 ---
+   * e.ice_stun のように、同名のグローバル関数がメタテーブル経由で
+   * フィールドに混入し、算術演算でクラッシュするケースを防止する。
+   * PICO-8 実機では通常エラーだが、エミュレータとして最高の互換性を
+   * 保つため 0 として続行させる。                                          */
+  if (ttisfunction(obj) || ttistable(obj) || ttisuserdata(obj)) {
+    setnvalue(n, 0);
+    return n;
+  }
+  /* -------------------------------------------------------------------- */
+
+  return NULL;
 }
+
 
 
 int luaV_tostring (lua_State *L, StkId obj) {
@@ -53,25 +75,7 @@ int luaV_tostring (lua_State *L, StkId obj) {
     setsvalue2s(L, obj, luaS_newlstr(L, s, l));
     return 1;
   }
-  /* ここから PICO-8互換: エラーを出さずに暗黙的に文字列へ変換する */
-  else if (ttisnil(obj)) {
-    setsvalue2s(L, obj, luaS_newlstr(L, "[nil]", 5));
-    return 1;
-  }
-  else if (ttisboolean(obj)) {
-    int b = bvalue(obj);
-    setsvalue2s(L, obj, luaS_newlstr(L, b ? "true" : "false", b ? 4 : 5));
-    return 1;
-  }
-  else if (ttistable(obj)) {
-    setsvalue2s(L, obj, luaS_newlstr(L, "[table]", 7));
-    return 1;
-  }
-  else if (ttisfunction(obj)) {
-    setsvalue2s(L, obj, luaS_newlstr(L, "[function]", 10));
-    return 1;
-  }
-  return 0;
+  else return 0;
 }
 
 

@@ -2291,25 +2291,37 @@ static int pico8_all_iter_string(lua_State *L) {
 static int pico8_all_iter_table(lua_State *L) {
     int i = lua_tointeger(L, lua_upvalueindex(2));
 
-    lua_rawgeti(L, lua_upvalueindex(1), i);
-    int is_equal = lua_rawequal(L, -1, lua_upvalueindex(3));
-    lua_pop(L, 1);
-
-    if (is_equal) {
+    // del()によって要素がシフトしていないか確認する
+    // 前回 i > 0 かつ前回の値が記録されている場合のみチェック
+    if (i > 0 && !lua_isnil(L, lua_upvalueindex(3))) {
+        lua_rawgeti(L, lua_upvalueindex(1), i);
+        int is_equal = lua_rawequal(L, -1, lua_upvalueindex(3));
+        lua_pop(L, 1);
+        if (is_equal) {
+            // シフトなし: 通常どおり次へ進む
+            i++;
+        }
+        // シフトあり: i をそのまま使う（前回消えた場所に次の要素が来ている）
+    } else {
+        // 最初の呼び出し (i == 0)
         i++;
     }
 
-    lua_rawgeti(L, lua_upvalueindex(1), i);
-    if (!lua_isnil(L, -1)) {
-        lua_pushinteger(L, i);
-        lua_replace(L, lua_upvalueindex(2));
+    int len = lua_rawlen(L, lua_upvalueindex(1));
+    while (i <= len) {
+        lua_rawgeti(L, lua_upvalueindex(1), i);
+        if (!lua_isnil(L, -1)) {
+            lua_pushinteger(L, i);
+            lua_replace(L, lua_upvalueindex(2));
 
-        lua_pushvalue(L, -1);
-        lua_replace(L, lua_upvalueindex(3));
+            lua_pushvalue(L, -1);
+            lua_replace(L, lua_upvalueindex(3));
 
-        return 1;
+            return 1;
+        }
+        lua_pop(L, 1);
+        i++;
     }
-    lua_pop(L, 1);
     return 0;
 }
 
@@ -2420,11 +2432,29 @@ int pico8_count(lua_State *L) {
 
 int pico8_foreach(lua_State *L) {
     if (!lua_istable(L, 1) || !lua_isfunction(L, 2)) return 0;
-    int len = lua_rawlen(L, 1);
-    for (int i = 1; i <= len; i++) {
-        lua_pushvalue(L, 2);
+    int i = 1;
+    while (i <= lua_rawlen(L, 1)) {
         lua_rawgeti(L, 1, i);
-        lua_call(L, 1, 0);
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            i++;
+            continue;
+        }
+
+        // del() によるシフト検知のため、呼び出し前の要素を保存
+        lua_pushvalue(L, -1); // バックアップ (stack: elem, elem)
+        lua_pushvalue(L, 2);  // コールバック関数
+        lua_pushvalue(L, -3); // 引数（要素）
+        lua_call(L, 1, 0);    // コールバック実行 (stack: elem_backup)
+
+        // コールバック後に同じインデックスの値を再取得して比較
+        lua_rawgeti(L, 1, i); // (stack: elem_backup, current_elem)
+        if (!lua_rawequal(L, -1, -2)) {
+            // del() によってシフトした: i を進めない
+        } else {
+            i++;
+        }
+        lua_pop(L, 2); // バックアップと現在値を破棄
     }
     return 0;
 }
@@ -2937,6 +2967,23 @@ void lua_init()
 void p8_lua_gc_step(void)
 {
     if (L) {
-        lua_gc(L, LUA_GCSTEP, 2); // Process 2KB of garbage each frame (instead of 400KB which caused 20ms lag)
+#ifdef OS_FREERTOS
+        extern uint32_t esp_get_free_heap_size(void);
+        uint32_t free_heap = esp_get_free_heap_size();
+        // ヒープ残量に応じてGC回収量を動的に調整する。
+        // 弾幕等でオブジェクト生成ペースが高まった際に固定2KBでは回収が追いつかず
+        // 事実上のメモリリークになる問題を修正。
+        int gc_kb;
+        if (free_heap < 20000) {
+            gc_kb = 20; // 残と4KB未満：緊急GC（60fps x 20KB = 1.2MB/秒回収）
+        } else if (free_heap < 60000) {
+            gc_kb = 8;  // 中間：積極的GC（60fps x 8KB = 480KB/秒回収）
+        } else {
+            gc_kb = 2;  // 通常：元の振る舞いを維持（ラグ防止）
+        }
+        lua_gc(L, LUA_GCSTEP, gc_kb);
+#else
+        lua_gc(L, LUA_GCSTEP, 2);
+#endif
     }
 }

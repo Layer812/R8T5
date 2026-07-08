@@ -48,6 +48,11 @@
 
 #ifdef IS_CARDPUTER
 #include <esp_heap_caps.h>
+// esp_memory_utils.h は Arduino ESP32 のビルドパスにないため、
+// ESP32-S3 内部SRAMのアドレス範囲で判定する。
+static inline bool rh_ptr_is_internal(const void *p) {
+    return ((uintptr_t)(p) >= 0x3FC80000UL);
+}
 // Try INTERNAL RAM first; fall back to SPIRAM so allocation never silently fails.
 void* rh_malloc(size_t size) {
     void *p = NULL;
@@ -66,11 +71,15 @@ void* rh_malloc_psram(size_t size) {
     return p;
 }
 void* rh_realloc(void *ptr, size_t size) {
+    if (!ptr) return rh_malloc(size);
     void *p = NULL;
-    if (size <= 32768) {
+    // 元のポインタが属するヒープ領域を判定し、同じ領域内で realloc する。
+    // size<=32KBの閾値でINTERNAL↔SPIRAM間を往復コピーするのを防止。
+    if (rh_ptr_is_internal(ptr)) {
         p = heap_caps_realloc(ptr, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    } else {
+        p = heap_caps_realloc(ptr, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
-    if (!p) p = heap_caps_realloc(ptr, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!p && size > 0) p = realloc(ptr, size);
     return p;
 }

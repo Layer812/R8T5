@@ -31,14 +31,21 @@ static void sb_append(StringBuilder *sb, const char *str, size_t len) {
     if (!sb->data) return;
     if (sb->length + len + 1 > sb->capacity) {
         sb->capacity = (sb->length + len + 1) * 2;
-        sb->data = (char *)rh_realloc(sb->data, sb->capacity);
+        char *new_data = (char *)rh_realloc(sb->data, sb->capacity);
+        if (!new_data) {
+            // rh_realloc 失敗時: C標準仕様により元の sb->data は解放されておらず有効。
+            // sb->data を直接上書きするとポインタが消滅してメモリリークになるため
+            // 一時変数で受け取り、失敗した場合は元の状態を保ったまま早期リターン。
+            sb->capacity = sb->length; // 現状のサイズに戻して整合性を保つ
+            return;
+        }
+        sb->data = new_data;
     }
-    if (sb->data) {
-        memcpy(sb->data + sb->length, str, len);
-        sb->length += len;
-        sb->data[sb->length] = '\0';
-    }
+    memcpy(sb->data + sb->length, str, len);
+    sb->length += len;
+    sb->data[sb->length] = '\0';
 }
+
 
 // UTF-8の絵文字をP8SCIIの1バイトコードに置換する関数
 static void replace_emoji_with_p8scii(char *str, const char *emoji, char p8scii_char) {

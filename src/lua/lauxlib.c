@@ -919,6 +919,12 @@ LUALIB_API const char *luaL_gsub (lua_State *L, const char *s, const char *p,
 size_t g_lua_memory_usage = 0;
 #ifdef OS_FREERTOS
 #include "esp_heap_caps.h"
+// esp_memory_utils.h は Arduino ESP32 のインクルードパスにないため
+// ESP32-S3 の内部SRAM アドレス範囲（0x3FC80000〜0x3FFFFFFF）で代替判定する。
+// PSRAM (SPIRAM) は通常 0x3C000000 帯にマップされるため確実に区別できる。
+static inline bool lua_ptr_is_internal(const void *p) {
+    return ((uintptr_t)(p) >= 0x3FC80000UL);
+}
 #endif
 
 size_t g_lua_active_blocks = 0;
@@ -989,14 +995,16 @@ static void *l_alloc (void *ud, void *ptr, size_t osize, size_t nsize) {
 #endif
 #ifdef OS_FREERTOS
     void *new_ptr = NULL;
-    // 再確保時も同様に、内部SRAMが潤沢なら内部SRAMへ
-    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) > 10000) {
+    // 元のポインタが属するヒープ領域を判定し、同じ領域内で realloc する。
+    // 空き容量の閾値でINTERNAL↔SPIRAMを往復コピーするとフラグメンテーションが急増する。
+    if (lua_ptr_is_internal(ptr)) {
+        // 内部SRAM上のブロック → 内部SRAMのまま拡張
         new_ptr = heap_caps_realloc(ptr, nsize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
-    // 空きが少なければPSRAMへ
-    if (!new_ptr) {
+    } else {
+        // SPIRAM上のブロック → SPIRAMのまま拡張
         new_ptr = heap_caps_realloc(ptr, nsize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
+    // 最終フォールバック（通常は発生しないはずだが念のため）
     if (!new_ptr) new_ptr = realloc(ptr, nsize);
 #else
     void *new_ptr = realloc(ptr, nsize);
