@@ -1,4 +1,4 @@
-# RONTO8 for M5Stack CoreS3 (v0.61)
+# RONTO8 for M5Stack CoreS3 (v0.62)
 
 ![RONTO8 - Touhou](toho.gif)
 
@@ -96,21 +96,21 @@ RONTO8 is heavily based on the incredible work of the open-source community:
 | Low Knight | krajzeg | [Link](https://www.lexaloffle.com/bbs/?tid=37055) | NG |  |
 | Mistigri | benjamin_soule | [Link](https://www.lexaloffle.com/bbs/?tid=3421) | NG>OK | OK |
 | Into Ruins | ericb | [Link](https://www.lexaloffle.com/bbs/?tid=49928) | NG |  |
-| Beckon the Hellspawn | LokiStriker | [Link](https://www.lexaloffle.com/bbs/?tid=51555) | TBC |  |
-| Woodworm | spratt | [Link](https://www.lexaloffle.com/bbs/?tid=142717) | TBC |  |
-| Pico Dino - Chrome's T-rex game reimagined | Yolwoocle | [Link](https://www.lexaloffle.com/bbs/?tid=40759) | TBC |  |
-| PRAXIS FIGHTER X | ericb | [Link](https://www.lexaloffle.com/bbs/?tid=140077) | TBC |  |
-| UFO Swamp Odyssey | paranoidcactus | [Link](https://www.lexaloffle.com/bbs/?tid=38153) | TBC |  |
-| Air Delivery | pianoman373 | [Link](https://www.lexaloffle.com/bbs/?tid=52598) | TBC |  |
-| Shape of Mind | Krystman | [Link](https://www.lexaloffle.com/bbs/?tid=50432) | TBC |  |
-| Build a Jetpack | Aymeri | [Link](https://www.lexaloffle.com/bbs/?tid=144726) | TBC |  |
-| Pico Fox | electricgryphon | [Link](https://www.lexaloffle.com/bbs/?tid=28067) | TBC |  |
-| Low Mem Sky | Liquidream | [Link](https://www.lexaloffle.com/bbs/?tid=32724) | TBC |  |
-| Alpine Alpaca | johanp | [Link](https://www.lexaloffle.com/bbs/?tid=32304) | TBC |  |
-| WitchCraft TD | unikotoast | [Link](https://www.lexaloffle.com/bbs/?tid=49166) | TBC |  |
-| From Rust To Ash | LokiStriker | [Link](https://www.lexaloffle.com/bbs/?tid=151194) | TBC |  |
-| Cattle Crisis | Krystman | [Link](https://www.lexaloffle.com/bbs/?tid=148741) | TBC |  |
-| Pico Checkmate | Krystman | [Link](https://www.lexaloffle.com/bbs/?tid=31213) | TBC |  |
+| Beckon the Hellspawn | LokiStriker | [Link](https://www.lexaloffle.com/bbs/?tid=51555) | OK | OK |
+| Woodworm | spratt | [Link](https://www.lexaloffle.com/bbs/?tid=142717) | OK | OK(Noise) |
+| Pico Dino - Chrome's T-rex game reimagined | Yolwoocle | [Link](https://www.lexaloffle.com/bbs/?tid=40759) | NG(continue) | OK |
+| PRAXIS FIGHTER X | ericb | [Link](https://www.lexaloffle.com/bbs/?tid=140077) | NG(heavy) |  |
+| UFO Swamp Odyssey | paranoidcactus | [Link](https://www.lexaloffle.com/bbs/?tid=38153) | NG |  |
+| Air Delivery | pianoman373 | [Link](https://www.lexaloffle.com/bbs/?tid=52598) | NG |  |
+| Shape of Mind | Krystman | [Link](https://www.lexaloffle.com/bbs/?tid=50432) | OK | OK |
+| Build a Jetpack | Aymeri | [Link](https://www.lexaloffle.com/bbs/?tid=144726) | OK | OK |
+| Pico Fox | electricgryphon | [Link](https://www.lexaloffle.com/bbs/?tid=28067) | OK(slow) | OK |
+| Low Mem Sky | Liquidream | [Link](https://www.lexaloffle.com/bbs/?tid=32724) | OK | OK |
+| Alpine Alpaca | johanp | [Link](https://www.lexaloffle.com/bbs/?tid=32304) | OK | OK |
+| WitchCraft TD | unikotoast | [Link](https://www.lexaloffle.com/bbs/?tid=49166) | OK | OK |
+| From Rust To Ash | LokiStriker | [Link](https://www.lexaloffle.com/bbs/?tid=151194) | NG |  |
+| Cattle Crisis | Krystman | [Link](https://www.lexaloffle.com/bbs/?tid=148741) | NG |  |
+| Pico Checkmate | Krystman | [Link](https://www.lexaloffle.com/bbs/?tid=31213) | OK | OK |
 | Sonic 2.5 SAGE 2020 | BoneVolt | [Link](https://www.lexaloffle.com/bbs/?tid=39517) | TBC |  |
 | MOTION笳蹴EC | shoma | [Link](https://www.lexaloffle.com/bbs/?tid=53392) | TBC |  |
 | Trial of the Sorcerer | Mot | [Link](https://www.lexaloffle.com/bbs/?tid=43833) | TBC |  |

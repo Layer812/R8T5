@@ -10,11 +10,18 @@ SemaphoreHandle_t doneSem;
 uint16_t* line_buffer[2];
 int render_idx = 0;
 
+// レンダリングパラメータ (起動時のモード選択で確定)
+int g_render_size = 192; // BT フルスクリーン時は 240
+int g_render_x    = 76;  // 表示 X オフセット
+int g_render_y    = 32;  // 表示 Y オフセット
+
 void flipTask(void *pvParameters) {
     while (1) {
         xSemaphoreTake(flipSem, portMAX_DELAY);
         if (render_idx >= 0 && line_buffer[0] != NULL) {
-            M5.Display.pushImageDMA(76, 32, 192, 192, line_buffer[render_idx]);
+            M5.Display.pushImageDMA(g_render_x, g_render_y,
+                                    g_render_size, g_render_size,
+                                    line_buffer[render_idx]);
         }
         render_idx = 1 - render_idx;
         xSemaphoreGive(doneSem);
@@ -29,6 +36,8 @@ void flipTask(void *pvParameters) {
 #include <freertos/task.h>
 #include <Preferences.h>
 #include <math.h>
+#include <NimBLEDevice.h>
+#include <NimBLEClient.h>
 
 extern "C" {
 #include "p8_emu.h"
@@ -66,6 +75,120 @@ static volatile bool g_emulator_init_failed = false;
 static volatile bool g_audio_task_started   = false;
 
 int g_volume = 255;
+
+// ===========================================================================
+// BLE HID ゲームパッド ホスト 実装 (NimBLE-Arduino)
+// ===========================================================================
+static bool       g_bt_gamepad_mode   = false;
+static bool       g_bt_connected      = false;
+static uint16_t   g_bt_state          = 0;   // 現在のボタン状態
+
+// ゲームパッド HID レポートパースエンジン (標準HID Gamepad Reportに対応)
+// Report: byte0=btns_low, byte1=btns_high, byte2=hatswitch, byte3=lx, byte4=ly
+static void parse_hid_report(const uint8_t* data, size_t len) {
+    if (len < 4) return;
+    uint16_t btns = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+    uint8_t  hat  = (len > 2) ? data[2] : 0xFF;
+    int8_t   lx   = (len > 3) ? (int8_t)data[3] : 0;
+    int8_t   ly   = (len > 4) ? (int8_t)data[4] : 0;
+
+    uint16_t state = 0;
+    // Hat switch (D-pad): 0=U, 1=UR, 2=R, 3=DR, 4=D, 5=DL, 6=L, 7=UL, 8=none
+    if (hat == 0 || hat == 1 || hat == 7) state |= (1 << 2); // UP
+    if (hat == 3 || hat == 4 || hat == 5) state |= (1 << 3); // DOWN
+    if (hat == 1 || hat == 2 || hat == 3) state |= (1 << 1); // RIGHT
+    if (hat == 5 || hat == 6 || hat == 7) state |= (1 << 0); // LEFT
+    // 左スティックを D-pad にマッピング (-128〜127、非感帯を小さめに)
+    if (lx < -40) state |= (1 << 0);
+    if (lx >  40) state |= (1 << 1);
+    if (ly < -40) state |= (1 << 2);
+    if (ly >  40) state |= (1 << 3);
+    // フェイスボタン (標準HIDゲームパッドレイアウト)
+    // bit0=Cross/A  bit1=Circle/B  bit3=Square/X  bit4=Triangle/Y
+    if (btns & (1 << 0)) state |= (1 << 4); // Cross   = O(ACTION1)
+    if (btns & (1 << 1)) state |= (1 << 5); // Circle  = X(ACTION2)
+    // Options/Start ボタンはコントローラーごとに当てが異なるので複数bitを確認
+    if (btns & (1 << 9))  state |= (1 << 6); // Options(PS4) = PAUSE
+    if (btns & (1 << 4))  state |= (1 << 6); // Start(Switch) = PAUSE
+    if (btns & (1 << 7))  state |= (1 << 6); // Start(Xbox) = PAUSE
+
+    g_bt_state = state;
+}
+
+// NimBLE チャラクタリスティック (HID Notify ハンドラ)
+static NimBLEClient* g_ble_client = nullptr;
+
+class BLEHidCallbacks : public NimBLEClientCallbacks {
+    // NimBLE v1.x: onDisconnect は引数 1つ
+    void onDisconnect(NimBLEClient* pClient) override {
+        g_bt_connected = false;
+        g_bt_state     = 0;
+    }
+};
+static BLEHidCallbacks g_ble_callbacks;
+
+static void ble_notify_cb(NimBLERemoteCharacteristic* pChar,
+                           uint8_t* pData, size_t length, bool isNotify) {
+    parse_hid_report(pData, length);
+}
+
+// BLE HID サービス UUID
+#define HID_SERVICE_UUID        "1812"
+#define HID_REPORT_UUID         "2A4D"
+
+// HID デバイスに接続してノティファイアィを登録する
+static bool ble_connect_to_gamepad(NimBLEAdvertisedDevice* dev) {
+    g_ble_client = NimBLEDevice::createClient();
+    g_ble_client->setClientCallbacks(&g_ble_callbacks, false);
+    g_ble_client->setConnectionParams(12, 12, 0, 200);
+
+    if (!g_ble_client->connect(dev)) {
+        NimBLEDevice::deleteClient(g_ble_client);
+        g_ble_client = nullptr;
+        return false;
+    }
+
+    auto* svc = g_ble_client->getService(HID_SERVICE_UUID);
+    if (!svc) {
+        g_ble_client->disconnect();
+        return false;
+    }
+
+    // HID Report キャラクタリスティックすべてにノティファイ 登録
+    auto chars = svc->getCharacteristics(true);
+    bool found = false;
+    for (auto& c : *chars) {
+        if (c->getUUID() == NimBLEUUID(HID_REPORT_UUID)) {
+            if (c->canNotify()) {
+                c->subscribe(true, ble_notify_cb);
+                found = true;
+            }
+        }
+    }
+    if (!found) {
+        g_ble_client->disconnect();
+        return false;
+    }
+
+    g_bt_connected = true;
+    return true;
+}
+
+// BLE スキャンコールバック: HID サービスを持つデバイスだけフィルタ (NimBLE v1.x API)
+class BLEScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
+public:
+    NimBLEAdvertisedDevice* found_device = nullptr;
+    // v1.x では非 const
+    void onResult(NimBLEAdvertisedDevice* adv) override {
+        if (adv->isAdvertisingService(NimBLEUUID(HID_SERVICE_UUID))) {
+            found_device = adv;
+            NimBLEDevice::getScan()->stop();
+        }
+    }
+};
+static BLEScanCallbacks g_scan_cb;
+// ===========================================================================
+
 bool g_held_O = false;
 bool g_held_X = false;
 
@@ -467,30 +590,45 @@ void process_volume_controls(uint16_t current_btn) {
 extern "C" void m5stack_update_input()
 {
     M5.update();
-    uint16_t current_btn = get_touch_state();
-    
-    process_volume_controls(current_btn);
 
-    static bool prev_held_O = false;
-    static bool prev_held_X = false;
-    if (g_emulator_ready && (g_held_O != prev_held_O || g_held_X != prev_held_X)) {
-        prev_held_O = g_held_O;
-        prev_held_X = g_held_X;
-        draw_virtual_gamepad();
-    }
+    if (g_bt_gamepad_mode) {
+        // --- BLE ゲームパッド入力 ---
+        // ノティファイハンドラで非同期更新される g_bt_state をそのまま使用
+        if (!g_emulator_ready) {
+            g_emulator_ready = true;
+            if (!g_audio_task_started) {
+                g_audio_task_started = true;
+                xTaskCreatePinnedToCore(audio_task, "audio_task", 4096, NULL, 5, NULL, 0);
+                M5.Display.fillScreen(TFT_BLACK);
+                // BT モードでは draw_virtual_gamepad() を呼ばない
+            }
+        }
+        extern uint16_t m_buttons[8];
+        m_buttons[0] = g_bt_state;
+    } else {
+        // --- タッチ入力 (既存コード) ---
+        uint16_t current_btn = get_touch_state();
+        process_volume_controls(current_btn);
 
-    if (!g_emulator_ready) {
-        g_emulator_ready = true;
-        if (!g_audio_task_started) {
-            g_audio_task_started = true;
-            xTaskCreatePinnedToCore(audio_task, "audio_task", 4096, NULL, 5, NULL, 0);
-            M5.Display.fillScreen(TFT_BLACK);
+        static bool prev_held_O = false;
+        static bool prev_held_X = false;
+        if (g_emulator_ready && (g_held_O != prev_held_O || g_held_X != prev_held_X)) {
+            prev_held_O = g_held_O;
+            prev_held_X = g_held_X;
             draw_virtual_gamepad();
         }
+        if (!g_emulator_ready) {
+            g_emulator_ready = true;
+            if (!g_audio_task_started) {
+                g_audio_task_started = true;
+                xTaskCreatePinnedToCore(audio_task, "audio_task", 4096, NULL, 5, NULL, 0);
+                M5.Display.fillScreen(TFT_BLACK);
+                draw_virtual_gamepad();
+            }
+        }
+        extern uint16_t m_buttons[8];
+        m_buttons[0] = current_btn;
     }
-    
-    extern uint16_t m_buttons[8];
-    m_buttons[0] = current_btn;
 }
 
 extern "C" void m5stack_suspend_frame_buf(void) {}
@@ -507,37 +645,42 @@ extern "C" void p8_render()
 {
     if (!m_memory || !line_buffer[0]) return;
     uint8_t* vram = &m_memory[0x6000]; // VRAM starts at 0x6000
-    
+
     xSemaphoreTake(doneSem, portMAX_DELAY);
     M5.update(); // SAFE ZONE for I2C
-    
-    for (int y = 0; y < 192; y++) {
-        for (int x = 0; x < 192; x++) {
+
+    // g_render_size に合わせて 128x128 PICO-8 画面を拡大レンダリング
+    // 通常モード: 192x192 / BT フルスクリーン: 240x240
+    int sz = g_render_size;
+    for (int y = 0; y < sz; y++) {
+        for (int x = 0; x < sz; x++) {
+            int src_x = (x * 128) / sz;
+            int src_y = (y * 128) / sz;
             uint8_t c;
-            int src_x = (x * 128) / 192;
-            int src_y = (y * 128) / 192;
             if (src_x % 2 == 0) {
                 c = vram[(src_y * 64) + (src_x / 2)] & 0x0F;
             } else {
                 c = (vram[(src_y * 64) + (src_x / 2)] >> 4) & 0x0F;
             }
-            line_buffer[render_idx][y * 192 + x] = m_colors[c];
+            line_buffer[render_idx][y * sz + x] = m_colors[c];
         }
     }
-    
+
     xSemaphoreGive(flipSem);
 }
 
 // ---------------------------------------------------------------------------
-// Splash screen
+// Splash screen — [START] バーチャルパッドあり / [BT Cnct] BLE ゲームパッド
 // ---------------------------------------------------------------------------
 
-void show_ronto8_splash() {
+enum SplashAction { SPLASH_START, SPLASH_BT };
+
+SplashAction show_ronto8_splash() {
     uint16_t r4_yellow = M5.Display.color565(253, 192, 0);
     M5.Display.fillScreen(r4_yellow);
     M5.Display.setTextColor(TFT_BLACK, r4_yellow);
-    
-    // 1. タイトル部分
+
+    // タイトル
     M5.Display.setTextSize(4);
     M5.Display.setCursor(58, 10);
     M5.Display.print("R8");
@@ -546,7 +689,7 @@ void show_ronto8_splash() {
     M5.Display.setCursor(58, 60);
     M5.Display.print("RONTO8 Core S3");
 
-    // 2. 説明文（3行復活）
+    // 説明文
     M5.Display.setTextSize(1);
     M5.Display.setCursor(58, 95);
     M5.Display.println("RONTO8: A nu wave in the pico8 console.");
@@ -555,29 +698,140 @@ void show_ronto8_splash() {
     M5.Display.setCursor(58, 125);
     M5.Display.println("Acceler8 the portable coding.");
 
-    // 3. ライセンス情報を一番下に配置
+    // ライセンス
     M5.Display.setCursor(58, 220);
     M5.Display.println("(C)RONTO8. BASED ON FEMTO8 & ZEPTO8.");
 
+    // START ボタン (左, 紺)
+    uint16_t col_start = M5.Display.color565(20, 20, 120);
+    M5.Display.fillRoundRect(30, 158, 118, 44, 8, col_start);
+    M5.Display.setTextColor(TFT_WHITE, col_start);
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(50, 172);
+    M5.Display.print("START");
+
+    // BT Cnct ボタン (右, 深緑)
+    uint16_t col_bt = M5.Display.color565(20, 100, 20);
+    M5.Display.fillRoundRect(172, 158, 118, 44, 8, col_bt);
+    M5.Display.setTextColor(TFT_WHITE, col_bt);
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(178, 163);
+    M5.Display.print("Bluetooth");
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(185, 178);
+    M5.Display.print("Cnct");
+
+    // タッチ待ちループ
     while (true) {
         M5.update();
-        if (M5.Touch.getCount() > 0) break;
-        
-        // 文字の点滅処理
-        if (millis() % 1000 < 500) M5.Display.setTextColor(TFT_BLACK, r4_yellow);
-        else M5.Display.setTextColor(r4_yellow, r4_yellow);
-        
-        M5.Display.setTextSize(2);
-        M5.Display.setCursor(60, 170); 
-        M5.Display.print("PRESS SCREEN");
+        if (M5.Touch.getCount() > 0) {
+            auto t = M5.Touch.getDetail(0);
+            if (t.isPressed()) {
+                int tx = t.x, ty = t.y;
+                if (ty >= 158 && ty <= 202) {
+                    if (tx >= 30  && tx <= 148) { delay(150); return SPLASH_START; }
+                    if (tx >= 172 && tx <= 290) { delay(150); return SPLASH_BT;    }
+                }
+            }
+        }
         delay(50);
     }
-    
-    // 最後に全消去してLoadingを表示
-    M5.Display.fillScreen(r4_yellow);
-    M5.Display.setTextColor(TFT_BLACK, r4_yellow);
-    M5.Display.setCursor(60, 180);
-    M5.Display.print("Loading...          ");
+}
+
+// ---------------------------------------------------------------------------
+// BLE ゲームパッド ペアリング画面
+// 成功 → true  タイムアウト/キャンセル → false (スプラッシュに戻る)
+// ---------------------------------------------------------------------------
+
+static bool do_bt_pairing() {
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(30, 65);
+    M5.Display.print("BT Connecting...");
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(M5.Display.color565(200, 200, 200), TFT_BLACK);
+    M5.Display.setCursor(10, 98);
+    M5.Display.print("Put gamepad in pairing mode.");
+    M5.Display.setCursor(10, 112);
+    M5.Display.print("Waiting up to 10 seconds...");
+
+    const uint32_t TIMEOUT_MS = 10000;
+    uint32_t start_time = millis();
+
+    // NimBLE スキャン開始 (HID デバイスを探す)
+    g_scan_cb.found_device = nullptr;
+    auto* scan = NimBLEDevice::getScan();
+    scan->setAdvertisedDeviceCallbacks(&g_scan_cb, false); // v1.x API
+    scan->setActiveScan(true);
+    scan->setInterval(100);
+    scan->setWindow(99);
+    scan->start(10, false); // 10秒スキャン
+
+    // スキャン結果を待機しながらカウントダウンを表示 (start_time/TIMEOUT_MSは上で宣言済み)
+    while (scan->isScanning() && (millis() - start_time < TIMEOUT_MS)) {
+        int sec = (int)((TIMEOUT_MS - (millis() - start_time)) / 1000) + 1;
+        M5.Display.setTextColor(M5.Display.color565(255, 200, 0), TFT_BLACK);
+        M5.Display.setTextSize(4);
+        M5.Display.setCursor(136, 148);
+        M5.Display.printf("%2d", sec);
+        M5.update();
+        delay(200);
+    }
+
+    if (g_scan_cb.found_device) {
+        // HID デバイス発見! 接続試行
+        M5.Display.fillScreen(TFT_BLACK);
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.setTextSize(1);
+        M5.Display.setCursor(10, 100);
+        M5.Display.print("Found device. Connecting...");
+
+        if (ble_connect_to_gamepad(g_scan_cb.found_device)) {
+
+        // 接続成功!
+            M5.Display.fillScreen(TFT_BLACK);
+            M5.Display.setTextColor(M5.Display.color565(0, 220, 80), TFT_BLACK);
+            M5.Display.setTextSize(2);
+            M5.Display.setCursor(60, 110);
+            M5.Display.print("Connected!");
+            delay(1000);
+            return true;
+        }
+    }
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(M5.Display.color565(220, 60, 60), TFT_BLACK);
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(20, 65);
+    M5.Display.print("Connection Failed");
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.setCursor(10, 100);
+    M5.Display.print("No gamepad found within 10s.");
+    M5.Display.setCursor(10, 114);
+    M5.Display.print("Tap OK to return to menu.");
+
+    uint16_t col_ok = M5.Display.color565(80, 80, 80);
+    M5.Display.fillRoundRect(110, 155, 100, 40, 8, col_ok);
+    M5.Display.setTextColor(TFT_WHITE, col_ok);
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(138, 167);
+    M5.Display.print("OK");
+
+    while (true) {
+        M5.update();
+        if (M5.Touch.getCount() > 0) {
+            auto t = M5.Touch.getDetail(0);
+            if (t.isPressed()) {
+                int tx = t.x, ty = t.y;
+                if (tx >= 110 && tx <= 210 && ty >= 155 && ty <= 195) {
+                    delay(200);
+                    return false;
+                }
+            }
+        }
+        delay(50);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -635,8 +889,9 @@ void setup()
 
     M5.Display.fillScreen(TFT_BLACK);
 
-    line_buffer[0] = (uint16_t*)heap_caps_malloc(192 * 192 * 2, MALLOC_CAP_SPIRAM);
-    line_buffer[1] = (uint16_t*)heap_caps_malloc(192 * 192 * 2, MALLOC_CAP_SPIRAM);
+    // BT フルスクリーン(240x240)も考慮して最大サイズで確保
+    line_buffer[0] = (uint16_t*)heap_caps_malloc(240 * 240 * 2, MALLOC_CAP_SPIRAM);
+    line_buffer[1] = (uint16_t*)heap_caps_malloc(240 * 240 * 2, MALLOC_CAP_SPIRAM);
     
     flipSem = xSemaphoreCreateBinary();
     doneSem = xSemaphoreCreateBinary();
@@ -662,12 +917,106 @@ void setup()
     g_browser_name_offsets = (uint16_t*)malloc(MAX_BROWSER_ENTRIES * sizeof(uint16_t));
     g_browser_is_dir       = (bool*)    malloc(MAX_BROWSER_ENTRIES * sizeof(bool));
 
-    show_ronto8_splash();
+    // ---- 起動モード選択: BT自動再接続 → スプラッシュ選択 ----
+    {
+        bool bt_initialized = false;
 
-    M5.Display.fillScreen(TFT_BLACK); // スプラッシュ後に一度だけ全体をクリア
+        // Preferences から前回 BT モード使用フラグを確認 → 自動再接続試行
+        {
+            Preferences prefs2;
+            prefs2.begin("ronto8", false);
+            bool was_bt = prefs2.getBool("bt_mode", false);
+            prefs2.end();
+
+            if (was_bt) {
+                // NimBLE 初期化 + スキャンで自動再接続試行
+                NimBLEDevice::init("");
+                NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+                bt_initialized = true;
+
+                // 再接続待機画面 (最大 5 秒)
+                M5.Display.fillScreen(TFT_BLACK);
+                M5.Display.setTextColor(M5.Display.color565(200, 200, 200), TFT_BLACK);
+                M5.Display.setTextSize(1);
+                M5.Display.setCursor(50, 105);
+                M5.Display.print("Reconnecting BT gamepad...");
+
+                g_scan_cb.found_device = nullptr;
+                auto* scan2 = NimBLEDevice::getScan();
+                scan2->setAdvertisedDeviceCallbacks(&g_scan_cb, false); // v1.x API
+                scan2->setActiveScan(true);
+                scan2->start(5, false);
+
+                uint32_t rc = millis();
+                while (scan2->isScanning() && (millis() - rc < 5000)) {
+                    int rem = (int)((5000 - (millis() - rc)) / 1000) + 1;
+                    M5.Display.setTextColor(M5.Display.color565(255, 200, 0), TFT_BLACK);
+                    M5.Display.setTextSize(3);
+                    M5.Display.setCursor(148, 128);
+                    M5.Display.printf("%d ", rem);
+                    M5.update();
+                    delay(200);
+                }
+
+                if (g_scan_cb.found_device) {
+                    if (ble_connect_to_gamepad(g_scan_cb.found_device)) {
+                        g_bt_gamepad_mode = true;
+                    }
+                }
+            }
+        }
+
+        // 自動再接続できなかった場合はスプラッシュ選択ループ
+        if (!g_bt_gamepad_mode) {
+            while (true) {
+                SplashAction action = show_ronto8_splash();
+                if (action == SPLASH_START) {
+                    // 通常モード: bt_mode = false として保存
+                    Preferences prefs2;
+                    prefs2.begin("ronto8", false);
+                    prefs2.putBool("bt_mode", false);
+                    prefs2.end();
+                    uint16_t r4y = M5.Display.color565(253, 192, 0);
+                    M5.Display.fillScreen(r4y);
+                    M5.Display.setTextColor(TFT_BLACK, r4y);
+                    M5.Display.setTextSize(2);
+                    M5.Display.setCursor(60, 180);
+                    M5.Display.print("Loading...");
+                    break;
+                } else {
+                    // BT Cnct: NimBLE 初期化 (初回のみ) してペアリング試行
+                    if (!bt_initialized) {
+                        NimBLEDevice::init("");
+                        NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+                        bt_initialized = true;
+                    }
+                    if (do_bt_pairing()) {
+                        g_bt_gamepad_mode = true;
+                        Preferences prefs2;
+                        prefs2.begin("ronto8", false);
+                        prefs2.putBool("bt_mode", true);
+                        prefs2.end();
+                        break;
+                    }
+                    // ペアリング失敗 → スプラッシュに戻る
+                }
+            }
+        }
+    }
+
+    // BT フルスクリーンモード: 240x240 でゲーム画面を拡大表示
+    if (g_bt_gamepad_mode) {
+        g_render_size = 240;
+        g_render_x    = (320 - 240) / 2; // = 40 (水平中央)
+        g_render_y    = 0;
+    }
+
+    M5.Display.fillScreen(TFT_BLACK);
     scan_browser_directory(g_browser_path);
     draw_browser();
-    draw_virtual_gamepad(); // コントローラーの描画は最初の一回だけ
+    if (!g_bt_gamepad_mode) {
+        draw_virtual_gamepad(); // バーチャルパッドは通常モードのみ
+    }
 }
 
 void process_volume_controls(uint16_t current_btn);
@@ -773,7 +1122,7 @@ void loop()
         g_audio_task_started = true;
         xTaskCreatePinnedToCore(audio_task, "audio_task", 4096, NULL, 5, NULL, 0);
         M5.Display.fillScreen(TFT_BLACK);
-        draw_virtual_gamepad();
+        if (!g_bt_gamepad_mode) draw_virtual_gamepad();
     } else {
         // Game running
         p8_step();
