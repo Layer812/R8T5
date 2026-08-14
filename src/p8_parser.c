@@ -24,19 +24,20 @@
 
 #ifdef OS_FREERTOS
 #include <esp_partition.h>
-/* spi_flash_mmap_handle_t is defined in esp_partition.h or esp_spi_flash.h */
+#include <spi_flash_mmap.h>
+/* esp_partition_mmap_handle_t is defined in esp_partition.h or esp_spi_flash.h */
 
-static spi_flash_mmap_handle_t g_lua_mmap_handle = 0;
+static esp_partition_mmap_handle_t g_lua_mmap_handle = 0;
 static const void *g_lua_mmap_ptr = NULL;
 
-static spi_flash_mmap_handle_t g_cart_mmap_handle = 0;
+static esp_partition_mmap_handle_t g_cart_mmap_handle = 0;
 static const void *g_cart_mmap_ptr = NULL;
 #endif
 
 void p8_unmap_lua_script(void) {
 #ifdef OS_FREERTOS
     if (g_lua_mmap_handle) {
-        spi_flash_munmap(g_lua_mmap_handle);
+        esp_partition_munmap(g_lua_mmap_handle);
         g_lua_mmap_handle = 0;
         g_lua_mmap_ptr = NULL;
     }
@@ -67,7 +68,7 @@ static const char* p8_map_lua_script(const uint8_t* lua_code, size_t length) {
     uint8_t zero = 0;
     esp_partition_write(part, length, &zero, 1);
 
-    if (esp_partition_mmap(part, 0, erase_size, SPI_FLASH_MMAP_DATA, &g_lua_mmap_ptr, &g_lua_mmap_handle) != ESP_OK) {
+    if (esp_partition_mmap(part, 0, erase_size, ESP_PARTITION_MMAP_DATA, &g_lua_mmap_ptr, &g_lua_mmap_handle) != ESP_OK) {
         fprintf(stderr, "Error mapping flash!\n");
         return NULL;
     }
@@ -86,7 +87,7 @@ static const char* p8_map_lua_script(const uint8_t* lua_code, size_t length) {
 void p8_unmap_cart_memory(void) {
 #ifdef OS_FREERTOS
     if (g_cart_mmap_handle) {
-        spi_flash_munmap(g_cart_mmap_handle);
+        esp_partition_munmap(g_cart_mmap_handle);
         g_cart_mmap_handle = 0;
         g_cart_mmap_ptr = NULL;
     }
@@ -106,7 +107,7 @@ const void* p8_map_cart_memory(const uint8_t* cart_data, size_t length) {
     
     if (esp_partition_erase_range(part, offset, erase_size) != ESP_OK) return NULL;
     if (esp_partition_write(part, offset, cart_data, length) != ESP_OK) return NULL;
-    if (esp_partition_mmap(part, offset, erase_size, SPI_FLASH_MMAP_DATA, &g_cart_mmap_ptr, &g_cart_mmap_handle) != ESP_OK) return NULL;
+    if (esp_partition_mmap(part, offset, erase_size, ESP_PARTITION_MMAP_DATA, &g_cart_mmap_ptr, &g_cart_mmap_handle) != ESP_OK) return NULL;
 
     return g_cart_mmap_ptr;
 #else

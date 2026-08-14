@@ -11,4 +11,6 @@ sample/
 .agents
 picotool
 *.lua
+*.py
+*.zip
 master_catalog_rich.csv

@@ -1,7 +1,7 @@
 #include <Arduino.h>
 /*
  * Created by Layer8
- * M5Stack CoreS3 entry point and hardware abstraction layer for RONTO8.
+ * M5Stack Tab5 entry point and hardware abstraction layer for RONTO8.
  */
 #include <M5Unified.h>
 
@@ -10,25 +10,124 @@ SemaphoreHandle_t doneSem;
 uint16_t* line_buffer[2];
 int render_idx = 0;
 
+// レンダリングパラメータ (起動時のモード選択で確定)
+int g_render_size = 128; // PICO-8 解像度 (PPAハードウェアスケーリングが720に拡大)
+int g_render_x    = (1280 - 720) / 2; // PPA出力の水平位置 (Tab5用)
+int g_render_y    = 0;   // PPA出力の Y オフセット
+
+// PPA前方宣言
+static bool ppa_present_region_scaled(int x, int y, int dst_width, int dst_height, int src_width, int src_height, const uint16_t *frame_buffer);
+
+// --- スケーリング用変数 ---
+static uint16_t* scaled_buf = nullptr;
+static int src_idx[720];
+
 void flipTask(void *pvParameters) {
+    // スケーリング用の座標テーブルを事前計算
+    for(int i = 0; i < 720; i++) {
+        src_idx[i] = (i * 128) / 720;
+    }
+    // PSRAMに720x720の拡大用バッファを確保
+    scaled_buf = (uint16_t*)heap_caps_malloc(720 * 720 * 2, MALLOC_CAP_SPIRAM);
+
     while (1) {
         xSemaphoreTake(flipSem, portMAX_DELAY);
-        if (render_idx >= 0 && line_buffer[0] != NULL) {
-            M5.Display.pushImageDMA(76, 32, 192, 192, line_buffer[render_idx]);
+        if (render_idx >= 0 && line_buffer[0] != NULL && scaled_buf != NULL) {
+            uint16_t* src = line_buffer[render_idx];
+
+            // Core 0 のパワーで一気に配列をコピー（超高速スケーリング）
+            for (int y = 0; y < 720; y++) {
+                uint16_t* src_row = &src[src_idx[y] * 128];
+                uint16_t* dst_row = &scaled_buf[y * 720];
+                for (int x = 0; x < 720; x++) {
+                    dst_row[x] = src_row[src_idx[x]];
+                }
+            }
+            // 拡大済みの画像をDMA転送
+            M5.Display.pushImageDMA(g_render_x, g_render_y, 720, 720, scaled_buf);
         }
         render_idx = 1 - render_idx;
         xSemaphoreGive(doneSem);
     }
 }
 
-
-
+#include <FS.h>
 #include <SPI.h>
+#include <Wire.h>
 #include <SD.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <driver/ppa.h>
+#include <lgfx/v1/platforms/esp32p4/Panel_DSI.hpp>
+
+// PPA (Pixel Processing Accelerator) parameters for Tab5
+static ppa_client_handle_t s_ppa_srm = nullptr;
+static uint16_t *s_dsi_fb = nullptr;
+static uint32_t s_dsi_fb_bytes = 0;
+static int s_phys_w = 0;
+static int s_phys_h = 0;
+static bool s_ppa_ready = false;
+
+static void init_ppa_fast_present(void) {
+    s_ppa_ready = false;
+    s_dsi_fb = nullptr;
+    auto *panel_dev = M5.Display.getPanel();
+    if (!panel_dev) return;
+
+    auto *dsi = static_cast<lgfx::Panel_DSI *>(panel_dev);
+    const auto detail = dsi->config_detail();
+    const auto cfg = dsi->config();
+    if (!detail.buffer || cfg.panel_width <= 0 || cfg.panel_height <= 0) return;
+
+    s_dsi_fb = static_cast<uint16_t *>(detail.buffer);
+    s_phys_w = cfg.panel_width;
+    s_phys_h = cfg.panel_height;
+    s_dsi_fb_bytes = (uint32_t)s_phys_w * (uint32_t)s_phys_h * sizeof(uint16_t);
+
+    ppa_client_config_t client_cfg = {};
+    client_cfg.oper_type = PPA_OPERATION_SRM;
+    client_cfg.max_pending_trans_num = 1;
+    client_cfg.data_burst_length = PPA_DATA_BURST_LENGTH_128;
+    if (ppa_register_client(&client_cfg, &s_ppa_srm) != ESP_OK) {
+        s_ppa_srm = nullptr;
+        return;
+    }
+    s_ppa_ready = true;
+}
+
+static bool ppa_present_region_scaled(int x, int y, int dst_width, int dst_height, int src_width, int src_height, const uint16_t *frame_buffer) {
+    if (!s_ppa_ready || !s_ppa_srm || !s_dsi_fb || !frame_buffer) return false;
+    
+    const int logical_w = M5.Display.width();
+    const int logical_h = M5.Display.height();
+    const int out_x = logical_h - (y + dst_height);
+    const int out_y = x;
+    if (out_x < 0 || out_y < 0 || out_x + dst_height > s_phys_w || out_y + dst_width > s_phys_h) return false;
+
+    ppa_srm_oper_config_t op = {};
+    op.in.buffer = (const void *)frame_buffer;
+    op.in.pic_w = src_width;
+    op.in.pic_h = src_height;
+    op.in.block_w = src_width;
+    op.in.block_h = src_height;
+    op.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+    
+    op.out.buffer = (void *)s_dsi_fb;
+    op.out.pic_w = s_phys_w;
+    op.out.pic_h = s_phys_h;
+    op.out.block_offset_x = out_x;
+    op.out.block_offset_y = out_y;
+    op.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+
+    op.rotation_angle = PPA_SRM_ROTATION_ANGLE_270;
+    op.scale_x = (float)dst_height / src_height;
+    op.scale_y = (float)dst_width / src_width;
+
+    return ppa_do_scale_rotate_mirror(s_ppa_srm, &op) == ESP_OK;
+}
 #include <Preferences.h>
 #include <math.h>
+// // #include <Bluepad32.h>
 
 extern "C" {
 #include "p8_emu.h"
@@ -66,6 +165,11 @@ static volatile bool g_emulator_init_failed = false;
 static volatile bool g_audio_task_started   = false;
 
 int g_volume = 255;
+
+// --- BLE ゲームパッド ---
+static bool       g_bt_gamepad_mode = false;
+static 
+
 bool g_held_O = false;
 bool g_held_X = false;
 
@@ -142,56 +246,56 @@ static void scan_browser_directory(const String& path)
 
 static void draw_browser()
 {
-    uint16_t bg_gray = M5.Display.color565(48, 48, 48);
+    uint16_t brand_color = M5.Display.color565(255, 120, 0); // Orange
+    uint16_t bg_gray = M5.Display.color565(30, 30, 30);
+    uint16_t list_bg = M5.Display.color565(20, 20, 20);
+
+    // Left and Right Bands are drawn by draw_virtual_gamepad now, but we'll draw them just in case
     
-    // 中央のファイル表示部分をゲーム画面と完全一致 (x=74, y=28)
-    M5.Display.fillRect(74, 28, 192, 192, bg_gray);
+    draw_virtual_gamepad();
 
-    uint16_t r4_yellow = M5.Display.color565(253, 192, 0);
-    M5.Display.fillRect(0, 0, 320, 28, r4_yellow);
-    M5.Display.setTextColor(TFT_BLACK, r4_yellow);
-
-    M5.Display.setCursor(10, 9);
-    M5.Display.setTextSize(2); // フォントサイズを2に戻す
-    M5.Display.println("R8 BROWSER");
-
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(TFT_WHITE, bg_gray);
-    M5.Display.setCursor(79, 34); 
+    // Center List Area Background
+    M5.Display.fillRect(280, 0, 720, 720, list_bg);
+    
+    // Header
+    M5.Display.fillRect(280, 0, 720, 70, bg_gray);
+    M5.Display.setTextSize(3);
+    M5.Display.setTextColor(brand_color, bg_gray);
+    M5.Display.setCursor(300, 25);
     M5.Display.println(g_browser_path);
 
-    int visible = 9; // 画面内に収まるよう調整
+    int visible = 12;
     int start = 0;
     if (g_browser_count > visible) {
         if (g_browser_cursor >= visible) start = g_browser_cursor - visible + 1;
         if (start + visible > g_browser_count) start = g_browser_count - visible;
     }
 
-    M5.Display.setTextSize(2); // フォントサイズを2に戻す
-    int y_pos = 44; // スタート位置を少し下げる
+    int y_pos = 90;
+    M5.Display.setTextSize(3);
     for (int i = start; i < start + visible && i < g_browser_count; i++) {
-        M5.Display.setCursor(79, y_pos); 
-        String name = g_browser_name_buf + g_browser_name_offsets[i];
-        if (g_browser_is_dir[i]) {
-            name = "[" + name + "]";
-        }
-        
-        // はみ出ないように15文字で折り返し防止
-        if (name.length() > 15) {
-            name = name.substring(0, 15);
-        }
-        
+        M5.Display.setCursor(300, y_pos);
         if (i == g_browser_cursor) {
-            M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
-            while (name.length() < 15) name += " ";
+            // Selected item highlighting
+            M5.Display.fillRect(280, y_pos - 10, 720, 50, brand_color);
+            M5.Display.setTextColor(TFT_BLACK, brand_color);
         } else {
-            M5.Display.setTextColor(TFT_WHITE, bg_gray);
+            M5.Display.setTextColor(TFT_WHITE, list_bg);
         }
         
-        M5.Display.println(name);
-        y_pos += 20; // 行間を20pxに設定（フォントサイズ2でも被らない距離）
+        char name_buf[40];
+        strncpy(name_buf, g_browser_name_buf + g_browser_name_offsets[i], 39);
+        name_buf[39] = ' ';
+        
+        if (g_browser_is_dir[i]) {
+            M5.Display.print("[DIR]  ");
+            M5.Display.println(name_buf);
+        } else {
+            M5.Display.print("       ");
+            M5.Display.println(name_buf);
+        }
+        y_pos += 50;
     }
-    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
 }
 
 // ---------------------------------------------------------------------------
@@ -243,52 +347,61 @@ uint16_t get_imu_input()
 // ---------------------------------------------------------------------------
 void draw_virtual_gamepad()
 {
-    uint16_t color_dpad = M5.Display.color565(180, 180, 180);
-    uint16_t color_btn  = M5.Display.color565(220, 220, 220);
+    uint16_t brand_color = M5.Display.color565(255, 120, 0); // Orange
+    uint16_t color_btn   = TFT_BLACK;
+    uint16_t color_btn_p = M5.Display.color565(80, 80, 80);
 
-    // --- D-Pad (左端の黒帯エリアに寄せる) ---
-    int cx = 35, cy = 180;
-    M5.Display.drawRoundRect(cx - 15, cy - 35, 30, 30, 4, color_dpad); // UP
-    M5.Display.drawRoundRect(cx - 15, cy + 5,  30, 30, 4, color_dpad); // DOWN
-    M5.Display.drawRoundRect(cx - 35, cy - 15, 30, 30, 4, color_dpad); // LEFT
-    M5.Display.drawRoundRect(cx + 5,  cy - 15, 30, 30, 4, color_dpad); // RIGHT
-    M5.Display.drawCircle(cx, cy, 4, color_dpad); // CENTER
+    // --- ゲーム画面用のオレンジ帯背景描画 ---
+    // (これがないとゲーム起動時に背景が黒のままになりボタンが見えなくなる)
+    M5.Display.fillRect(0, 0, 280, 720, brand_color);
+    M5.Display.fillRect(1000, 0, 280, 720, brand_color);
 
-    // --- STARTボタン ---
-    // さらに2ドット右、16ドット下
-    int sx = 273, sy = 182;
-    M5.Display.drawRoundRect(sx, sy, 45, 20, 4, color_dpad); 
-    M5.Display.setCursor(sx + 8, sy + 6);
-    M5.Display.setTextColor(color_dpad);
-    M5.Display.setTextSize(1);
-    M5.Display.print("START");
+    // --- Top Left Logo (Graphic + Text Badge) ---
+    int lx = 20, ly = 20;
+    M5.Display.fillRoundRect(lx, ly, 220, 60, 30, color_btn);
+    M5.Display.fillCircle(lx + 30, ly + 30, 20, brand_color); // Orange dot inside black pill
+    M5.Display.setTextColor(brand_color, color_btn);
+    M5.Display.setTextSize(3);
+    M5.Display.setCursor(lx + 65, ly + 20);
+    M5.Display.print("Ronto 8");
 
-    // --- ボリュームボタン (カーソルの上) ---
-    // さらに2px下に移動
-    int vx = 35;
-    M5.Display.drawTriangle(vx, 56, vx - 10, 72, vx + 10, 72, color_dpad); // UP
-    M5.Display.drawTriangle(vx, 102, vx - 10, 86, vx + 10, 86, color_dpad); // DOWN
+    // --- D-Pad (Solid Black Cross) ---
+    // マルチタッチ干渉を防ぐため、Y座標を意図的に上部に配置
+    int cx = 136, cy = 350;
+    M5.Display.fillRoundRect(cx - 25, cy - 85, 50, 170, 10, color_btn); // Vertical
+    M5.Display.fillRoundRect(cx - 85, cy - 25, 170, 50, 10, color_btn); // Horizontal
+    M5.Display.fillCircle(cx, cy, 20, M5.Display.color565(40,40,40));   // Center texture
 
-    // --- アクションボタン (右上エリアに配置) ---
-    uint16_t color_btn_O = g_held_O ? M5.Display.color565(50, 50, 50) : M5.Display.color565(180, 180, 180);
-    uint16_t color_bg_O  = g_held_O ? M5.Display.color565(180, 180, 180) : TFT_BLACK;
+    // --- Volume Buttons (Pills) ---
+    M5.Display.fillRoundRect(80, 530, 100, 50, 25, color_btn); 
+    M5.Display.fillRoundRect(80, 610, 100, 50, 25, color_btn); 
+    M5.Display.setTextColor(brand_color);
+    M5.Display.setTextSize(3);
+    M5.Display.setCursor(120, 545); M5.Display.print("+");
+    M5.Display.setCursor(120, 625); M5.Display.print("-");
 
-    int ox = 295, oy = 50; // Oボタン
-    M5.Display.fillCircle(ox, oy, 20, color_bg_O);
-    M5.Display.drawCircle(ox, oy, 20, color_btn_O);
-    M5.Display.drawCircle(ox, oy, 18, color_btn_O);
-    M5.Display.drawCircle(ox, oy, 10, color_btn_O); // なかの〇をラインで
+    // --- START Button (Graphic Icon instead of Text) ---
+    M5.Display.fillRoundRect(1060, 20, 140, 60, 30, color_btn);
+    // Play icon (triangle) for START
+    M5.Display.fillTriangle(1115, 35, 1115, 65, 1145, 50, brand_color);
 
-    uint16_t color_btn_X = g_held_X ? M5.Display.color565(50, 50, 50) : M5.Display.color565(180, 180, 180);
-    uint16_t color_bg_X  = g_held_X ? M5.Display.color565(180, 180, 180) : TFT_BLACK;
+    // --- O / X (Symbols without text) ---
+    // マルチタッチ干渉を防ぐため、Y座標を意図的に下部に配置
+    int ox = 1100, oy = 600;
+    int xx = 1200, xy = 460;
 
-    int xx = 295, xy = 126; // Xボタン
-    M5.Display.fillCircle(xx, xy, 20, color_bg_X);
-    M5.Display.drawCircle(xx, xy, 20, color_btn_X);
-    M5.Display.drawCircle(xx, xy, 18, color_btn_X);
-    // なかの×をラインで
-    M5.Display.drawLine(xx - 7, xy - 7, xx + 7, xy + 7, color_btn_X);
-    M5.Display.drawLine(xx - 7, xy + 7, xx + 7, xy - 7, color_btn_X);
+    uint16_t color_bg_O = g_held_O ? color_btn_p : color_btn;
+    M5.Display.fillCircle(ox, oy, 60, color_bg_O);
+    M5.Display.drawCircle(ox, oy, 25, brand_color);
+    M5.Display.drawCircle(ox, oy, 24, brand_color);
+    M5.Display.drawCircle(ox, oy, 26, brand_color);
+
+    uint16_t color_bg_X = g_held_X ? color_btn_p : color_btn;
+    M5.Display.fillCircle(xx, xy, 60, color_bg_X);
+    for(int i=-3; i<=3; i++) {
+        M5.Display.drawLine(xx - 25 + i, xy - 25, xx + 25 + i, xy + 25, brand_color);
+        M5.Display.drawLine(xx + 25 + i, xy - 25, xx - 25 + i, xy + 25, brand_color);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -310,17 +423,14 @@ uint16_t get_touch_state()
         int tx = detail.x;
         int ty = detail.y;
 
-        // --- 左端エリア (D-Pad + Volume) ---
-        if (tx < 120) {
-            if (ty > 120) {
-                int cx = 35, cy = 180; // 描画位置と合わせる
+        // --- 左側エリア (D-Pad + Volume) ---
+        if (tx < 350) {
+            if (ty < 500) { // 上部はD-Pad
+                int cx = 136, cy = 350;
                 int dx = tx - cx;
                 int dy = ty - cy;
-                
-                if (dx*dx + dy*dy > 5*5) { // デッドゾーンを極小化して抜けを防止！
+                if (dx*dx + dy*dy > 20*20) { // デッドゾーン
                     float angle = atan2f((float)dy, (float)dx) * (180.0f / (float)M_PI);
-                    
-                    // マリオ対策：上下左右のストライクゾーンを広め、斜めを狭くする
                     if (angle > -35.0f  && angle <  35.0f)   btn_state |= (1 << 1); // RIGHT
                     else if (angle >  145.0f || angle < -145.0f) btn_state |= (1 << 0); // LEFT
                     else if (angle >  55.0f  && angle <  125.0f) btn_state |= (1 << 3); // DOWN
@@ -332,38 +442,40 @@ uint16_t get_touch_state()
                         if (angle <= -125.0f && angle >= -145.0f) { btn_state |= (1 << 0); btn_state |= (1 << 2); }
                     }
                 }
-            } else if (ty > 46 && ty <= 81) {
+            } else if (ty >= 500 && ty < 590) {
                 btn_state |= (1 << 8); // VOL_UP
-            } else if (ty > 81 && ty <= 120) {
+            } else if (ty >= 590) {
                 btn_state |= (1 << 7); // VOL_DOWN
             }
         }
         // --- STARTボタン ---
-        // 新しい位置: x=271, y=162 -> さらに16ドット下へ
-        else if (tx >= 250 && tx <= 320 && ty >= 161 && ty <= 211) {
+        else if (tx >= 1000 && ty <= 150) {
             btn_state |= (1 << 6);
         }
-        // --- アクションボタン (右上エリア) ---
-          else if (tx >= 250 && ty < 160) {
-            int dxO = tx - 295, dyO = ty - 50;
-            int dxX = tx - 295, dyX = ty - 126;
+        // --- アクションボタン (右側エリア) ---
+        else if (tx >= 950) {
+            int ox = 1100, oy = 600;
+            int xx = 1200, xy = 460;
+            
+            int dxO = tx - ox, dyO = ty - oy;
+            int dxX = tx - xx, dyX = ty - xy;
             int dO = dxO*dxO + dyO*dyO;
             int dX = dxX*dxX + dyX*dyX;
             
-            if (dO < 38*38) touch_O = true;
-            if (dX < 38*38) touch_X = true;
+            if (dO < 90*90) touch_O = true;
+            if (dX < 90*90) touch_X = true;
             if (dO < min_dist_O) min_dist_O = dO;
             if (dX < min_dist_X) min_dist_X = dX;
             
-            // Bダッシュジャンプ (意図的に真ん中を押した時だけ両方ON)
-            if (tx >= 250 && tx <= 320 && ty >= 80 && ty <= 96) {
+            // Bダッシュジャンプ用の中間タッチ判定 (意図的に両方の間を押した場合)
+            if (tx >= 1050 && tx <= 1250 && ty >= 480 && ty <= 580) {
                 touch_O = true;
                 touch_X = true;
             }
         }
     }
 
-    // O button long press logic (only toggle if touch is closer to O)
+    // O button long press logic
     bool active_O = touch_O && (min_dist_O <= min_dist_X);
     static uint32_t press_start_time_O = 0;
     static bool prev_active_O = false;
@@ -372,7 +484,6 @@ uint16_t get_touch_state()
         if (!prev_active_O) {
             press_start_time_O = millis();
             toggled_O_this_press = false;
-            // Immediate release upon touch if it's currently held
             if (g_held_O) {
                 g_held_O = false;
                 toggled_O_this_press = true;
@@ -396,7 +507,6 @@ uint16_t get_touch_state()
         if (!prev_active_X) {
             press_start_time_X = millis();
             toggled_X_this_press = false;
-            // Immediate release upon touch if it's currently held
             if (g_held_X) {
                 g_held_X = false;
                 toggled_X_this_press = true;
@@ -418,27 +528,25 @@ uint16_t get_touch_state()
 // Audio task
 // ---------------------------------------------------------------------------
 
+static constexpr size_t kP8RingCount = 4;
+static int16_t s_audio_ring[kP8RingCount][512];
+static size_t s_audio_ring_pos = 0;
+
 static void audio_task(void *pvParameters)
 {
-    const int sample_count = 256;
-    int16_t *audio_buf[2];
-    audio_buf[0] = (int16_t *)malloc(sample_count * sizeof(int16_t));
-    audio_buf[1] = (int16_t *)malloc(sample_count * sizeof(int16_t));
-    if (!audio_buf[0] || !audio_buf[1]) {
-        if (audio_buf[0]) free(audio_buf[0]);
-        if (audio_buf[1]) free(audio_buf[1]);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    int current_buf = 0;
+    const int sample_count = 512;
     while (1) {
-        render_sounds(audio_buf[current_buf], sample_count);
+        int16_t *dst = s_audio_ring[s_audio_ring_pos];
+        render_sounds(dst, sample_count);
 
-        while (!M5.Speaker.playRaw(audio_buf[current_buf], sample_count, 22050, false, 1, 0)) {
+        int retry = 0;
+        // 実績コードに合わせ、チャンネル0に固定し、ストリーミング再生(第7引数=false)
+        // 実績コードに合わせて「チャンネル 1」を使用
+        while (!M5.Speaker.playRaw(dst, sample_count, 22050, false, 1, 1, false)) {
             vTaskDelay(pdMS_TO_TICKS(1));
+            if (++retry > 100) { break; }
         }
-        current_buf = 1 - current_buf;
+        s_audio_ring_pos = (s_audio_ring_pos + 1) % kP8RingCount;
     }
 }
 
@@ -467,30 +575,29 @@ void process_volume_controls(uint16_t current_btn) {
 extern "C" void m5stack_update_input()
 {
     M5.update();
-    uint16_t current_btn = get_touch_state();
-    
-    process_volume_controls(current_btn);
 
-    static bool prev_held_O = false;
-    static bool prev_held_X = false;
-    if (g_emulator_ready && (g_held_O != prev_held_O || g_held_X != prev_held_X)) {
-        prev_held_O = g_held_O;
-        prev_held_X = g_held_X;
-        draw_virtual_gamepad();
-    }
+        // --- タッチ入力 (既存コード) ---
+        uint16_t current_btn = get_touch_state();
+        process_volume_controls(current_btn);
 
-    if (!g_emulator_ready) {
-        g_emulator_ready = true;
-        if (!g_audio_task_started) {
-            g_audio_task_started = true;
-            xTaskCreatePinnedToCore(audio_task, "audio_task", 4096, NULL, 5, NULL, 0);
-            M5.Display.fillScreen(TFT_BLACK);
+        static bool prev_held_O = false;
+        static bool prev_held_X = false;
+        if (g_emulator_ready && (g_held_O != prev_held_O || g_held_X != prev_held_X)) {
+            prev_held_O = g_held_O;
+            prev_held_X = g_held_X;
             draw_virtual_gamepad();
         }
-    }
-    
-    extern uint16_t m_buttons[8];
-    m_buttons[0] = current_btn;
+        if (!g_emulator_ready) {
+            g_emulator_ready = true;
+            if (!g_audio_task_started) {
+                g_audio_task_started = true;
+                xTaskCreatePinnedToCore(audio_task, "audio_task", 8192, NULL, 7, NULL, 1);
+                M5.Display.fillScreen(TFT_BLACK);
+                draw_virtual_gamepad();
+            }
+        }
+        extern uint16_t m_buttons[2]; // PLAYER_COUNT=2
+        m_buttons[0] = current_btn;
 }
 
 extern "C" void m5stack_suspend_frame_buf(void) {}
@@ -507,78 +614,56 @@ extern "C" void p8_render()
 {
     if (!m_memory || !line_buffer[0]) return;
     uint8_t* vram = &m_memory[0x6000]; // VRAM starts at 0x6000
-    
+
     xSemaphoreTake(doneSem, portMAX_DELAY);
     M5.update(); // SAFE ZONE for I2C
-    
-    for (int y = 0; y < 192; y++) {
-        for (int x = 0; x < 192; x++) {
-            uint8_t c;
-            int src_x = (x * 128) / 192;
-            int src_y = (y * 128) / 192;
-            if (src_x % 2 == 0) {
-                c = vram[(src_y * 64) + (src_x / 2)] & 0x0F;
-            } else {
-                c = (vram[(src_y * 64) + (src_x / 2)] >> 4) & 0x0F;
-            }
-            line_buffer[render_idx][y * 192 + x] = m_colors[c];
+
+    // 出力先バッファのポインタ
+    uint16_t* dest = line_buffer[render_idx];
+
+    // if文と割り算を排除した超高速ループ (2ピクセル同時処理)
+    // 128x128固定出力、PPAが720x720にハードウェアスケーリング
+    for (int y = 0; y < 128; y++) {
+        int y_offset = y * 64;
+        for (int x = 0; x < 64; x++) {
+            uint8_t pair = vram[y_offset + x];
+            *dest++ = m_colors[pair & 0x0F];
+            *dest++ = m_colors[pair >> 4];
         }
     }
-    
+
     xSemaphoreGive(flipSem);
 }
 
 // ---------------------------------------------------------------------------
-// Splash screen
+// Splash screen — [START] バーチャルパッドあり / [BT Cnct] BLE ゲームパッド
 // ---------------------------------------------------------------------------
 
-void show_ronto8_splash() {
-    uint16_t r4_yellow = M5.Display.color565(253, 192, 0);
-    M5.Display.fillScreen(r4_yellow);
-    M5.Display.setTextColor(TFT_BLACK, r4_yellow);
+enum SplashAction { SPLASH_START, SPLASH_BT };
+
+SplashAction show_ronto8_splash() {
+    uint16_t brand_color = M5.Display.color565(255, 120, 0); // Orange
+    M5.Display.fillScreen(brand_color);
     
-    // 1. タイトル部分
-    M5.Display.setTextSize(4);
-    M5.Display.setCursor(58, 10);
-    M5.Display.print("R8");
-
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(58, 60);
-    M5.Display.print("RONTO8 Core S3");
-
-    // 2. 説明文（3行復活）
-    M5.Display.setTextSize(1);
-    M5.Display.setCursor(58, 95);
-    M5.Display.println("RONTO8: A nu wave in the pico8 console.");
-    M5.Display.setCursor(58, 110);
-    M5.Display.println("Powering beyond hardware limitations.");
-    M5.Display.setCursor(58, 125);
-    M5.Display.println("Acceler8 the portable coding.");
-
-    // 3. ライセンス情報を一番下に配置
-    M5.Display.setCursor(58, 220);
-    M5.Display.println("(C)RONTO8. BASED ON FEMTO8 & ZEPTO8.");
-
-    while (true) {
-        M5.update();
-        if (M5.Touch.getCount() > 0) break;
-        
-        // 文字の点滅処理
-        if (millis() % 1000 < 500) M5.Display.setTextColor(TFT_BLACK, r4_yellow);
-        else M5.Display.setTextColor(r4_yellow, r4_yellow);
-        
-        M5.Display.setTextSize(2);
-        M5.Display.setCursor(60, 170); 
-        M5.Display.print("PRESS SCREEN");
-        delay(50);
-    }
+    // Premium Splash Badge
+    int lx = 340, ly = 260;
+    M5.Display.fillRoundRect(lx, ly, 600, 200, 100, TFT_BLACK); // Black Pill
+    M5.Display.fillCircle(lx + 100, ly + 100, 70, brand_color); // Orange Inner Dot
     
-    // 最後に全消去してLoadingを表示
-    M5.Display.fillScreen(r4_yellow);
-    M5.Display.setTextColor(TFT_BLACK, r4_yellow);
-    M5.Display.setCursor(60, 180);
-    M5.Display.print("Loading...          ");
+    M5.Display.setTextColor(brand_color, TFT_BLACK);
+    M5.Display.setTextSize(6);
+    M5.Display.setCursor(lx + 210, ly + 80);
+    M5.Display.print("Ronto 8");
+    
+    delay(2000);
+    return SPLASH_START;
 }
+
+// ---------------------------------------------------------------------------
+// BLE ゲームパッド ペアリング画面
+// 成功 → true  タイムアウト/キャンセル → false (スプラッシュに戻る)
+// ---------------------------------------------------------------------------
+
 
 // ---------------------------------------------------------------------------
 // ROM loader
@@ -608,8 +693,9 @@ void load_selected_rom()
         g_emulator_ready = true;
         // Clear the line buffers so the previous game's frame doesn't flash
         extern uint16_t *line_buffer[2];
-        if (line_buffer[0]) memset(line_buffer[0], 0, 192 * 192 * 2);
-        if (line_buffer[1]) memset(line_buffer[1], 0, 192 * 192 * 2);
+        // 確保しているサイズをクリアする
+        if (line_buffer[0]) memset(line_buffer[0], 0, 720 * 720 * 2);
+        if (line_buffer[1]) memset(line_buffer[1], 0, 720 * 720 * 2);
     } else {
         g_emulator_init_failed = true;
     }
@@ -621,27 +707,51 @@ void load_selected_rom()
 
 void setup()
 {
+    esp_log_level_set("*", ESP_LOG_NONE); // ログを無効化して高速化
+    
     auto cfg = M5.config();
     M5.begin(cfg);
+    
+    if (M5.Display.width() < M5.Display.height()) {
+        M5.Display.setRotation(1);
+    }
+    M5.Display.setSwapBytes(true);
+    M5.Display.fillScreen(0x0000);
+    init_ppa_fast_present();
     
     Preferences prefs;
     prefs.begin("ronto8", false);
     g_volume = prefs.getInt("volume", 255);
     prefs.end();
 
-    M5.Speaker.begin();
-    M5.Speaker.setVolume(g_volume);
-    M5.Speaker.setChannelVolume(0, 255); // Ensure channel 0 is at max volume
+    if (M5.Speaker.isRunning()) {
+        M5.Speaker.end();
+    }
+    auto spk_cfg = M5.Speaker.config();
+    spk_cfg.task_pinned_core = 1; // 実績コードに合わせて Core 1
+    spk_cfg.task_priority = 8;
+    spk_cfg.dma_buf_len = 512;
+    spk_cfg.dma_buf_count = 8;
+    M5.Speaker.config(spk_cfg);
+
+    if (M5.Speaker.isEnabled()) {
+        M5.Speaker.begin();
+    }
+    int safe_volume = (g_volume > 128) ? 128 : g_volume;
+    M5.Speaker.setVolume(safe_volume);
+    M5.Speaker.setChannelVolume(0, 255);
+    M5.Speaker.setChannelVolume(1, 255); // チャンネル1の音量も最大に
 
     M5.Display.fillScreen(TFT_BLACK);
 
-    line_buffer[0] = (uint16_t*)heap_caps_malloc(192 * 192 * 2, MALLOC_CAP_SPIRAM);
-    line_buffer[1] = (uint16_t*)heap_caps_malloc(192 * 192 * 2, MALLOC_CAP_SPIRAM);
+    // Tab5の解像度に合わせて最大サイズで確保
+    line_buffer[0] = (uint16_t*)heap_caps_malloc(720 * 720 * 2, MALLOC_CAP_SPIRAM);
+    line_buffer[1] = (uint16_t*)heap_caps_malloc(720 * 720 * 2, MALLOC_CAP_SPIRAM);
     
     flipSem = xSemaphoreCreateBinary();
     doneSem = xSemaphoreCreateBinary();
     xSemaphoreGive(doneSem);
-    xTaskCreatePinnedToCore(flipTask, "flipTask", 4096, NULL, configMAX_PRIORITIES - 2, NULL, 1);
+    xTaskCreatePinnedToCore(flipTask, "flipTask", 4096, NULL, configMAX_PRIORITIES - 2, NULL, 0);
     
     M5.Display.setColorDepth(16);
     M5.Display.setSwapBytes(true);
@@ -651,9 +761,9 @@ void setup()
     p8_sprite.setPsram(false);
     p8_sprite.createSprite(128, 128);
 
-    // CoreS3 SD card CS pin = 4
-    SPI.begin(36, 35, 37, 4);
-    if (!SD.begin(4, SPI, 25000000)) {
+    // M5Stack Tab5 SD card pins: SCK=43, MISO=39, MOSI=44, CS=42
+    SPI.begin(43, 39, 44, 42);
+    if (!SD.begin(42, SPI, 25000000)) {
         M5.Display.println("SD Card Mount Failed");
         while (1) { delay(100); }
     }
@@ -662,12 +772,39 @@ void setup()
     g_browser_name_offsets = (uint16_t*)malloc(MAX_BROWSER_ENTRIES * sizeof(uint16_t));
     g_browser_is_dir       = (bool*)    malloc(MAX_BROWSER_ENTRIES * sizeof(bool));
 
-    show_ronto8_splash();
+    // ---- 起動モード選択 ----
+    // Bluetooth機能は無効化されているため、常にタッチパッドモード
+    g_bt_gamepad_mode = false;
+    
+    while (true) {
+        SplashAction action = show_ronto8_splash();
+        if (action == SPLASH_START) {
+            Preferences prefs2;
+            prefs2.begin("ronto8", false);
+            prefs2.putBool("bt_mode", false);
+            prefs2.end();
+            uint16_t r4y = M5.Display.color565(253, 192, 0);
+            M5.Display.fillScreen(r4y);
+            M5.Display.setTextColor(TFT_BLACK, r4y);
+            M5.Display.setTextSize(2);
+            M5.Display.setCursor(60, 180);
+            M5.Display.print("Loading...");
+            break;
+        } else {
+            // SPLASH_BT が選択された場合も無効メッセージを出して戻る
+            M5.Display.fillScreen(TFT_BLACK);
+            M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+            M5.Display.setTextSize(2);
+            M5.Display.setCursor(20, 100);
+            M5.Display.print("BT Pad is disabled.");
+            delay(1500);
+        }
+    }
 
-    M5.Display.fillScreen(TFT_BLACK); // スプラッシュ後に一度だけ全体をクリア
+    M5.Display.fillScreen(TFT_BLACK);
     scan_browser_directory(g_browser_path);
     draw_browser();
-    draw_virtual_gamepad(); // コントローラーの描画は最初の一回だけ
+    draw_virtual_gamepad();
 }
 
 void process_volume_controls(uint16_t current_btn);
@@ -771,10 +908,13 @@ void loop()
 
     } else if (g_emulator_ready && !g_audio_task_started) {
         g_audio_task_started = true;
-        xTaskCreatePinnedToCore(audio_task, "audio_task", 4096, NULL, 5, NULL, 0);
+        xTaskCreatePinnedToCore(audio_task, "audio_task", 8192, NULL, 7, NULL, 1);
         M5.Display.fillScreen(TFT_BLACK);
-        draw_virtual_gamepad();
+        if (!g_bt_gamepad_mode) draw_virtual_gamepad();
     } else {
-        // Game running
+        // Game running at 60FPS
+        static TickType_t xLastWakeTime = xTaskGetTickCount();
+        const TickType_t xFrequency = pdMS_TO_TICKS(16); // 60FPS
         p8_step();
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }}
