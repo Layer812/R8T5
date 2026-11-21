@@ -1324,6 +1324,11 @@ int _memcpy(lua_State *L)
         unsigned chunk = MIN(MIN(len, 0x2000 - (sourceaddr & 0x1fff)), 0x2000 - (destaddr & 0x1fff));
         unsigned destaddr1 = addr_remap(destaddr);
         unsigned sourceaddr1 = addr_remap(sourceaddr);
+        if (destaddr1 >= MEMORY_SIZE || sourceaddr1 >= MEMORY_SIZE ||
+            chunk > MEMORY_SIZE - destaddr1 || chunk > MEMORY_SIZE - sourceaddr1) {
+            lua_pushinteger(L, orig_destaddr);
+            return 1;
+        }
         memmove(m_memory + destaddr1, m_memory + sourceaddr1, chunk);
         destaddr += chunk;
         sourceaddr += chunk;
@@ -1349,6 +1354,8 @@ int _memset(lua_State *L)
     while (len > 0) {
         unsigned chunk = MIN(len, 0x2000 - (destaddr & 0x1fff));
         unsigned destaddr1 = addr_remap(destaddr);
+        if (destaddr1 >= MEMORY_SIZE || chunk > MEMORY_SIZE - destaddr1)
+            return 0;
         memset(m_memory + destaddr1, val, chunk);
         destaddr += chunk;
         len -= chunk;
@@ -1368,7 +1375,7 @@ int peek(lua_State *L)
     luaL_checkstack(L, n, "too many values");
 
     for (unsigned i=0;i<n;++i) {
-        if (i >= MEMORY_SIZE - addr)
+        if (addr >= MEMORY_SIZE || i >= MEMORY_SIZE - addr)
             lua_pushinteger(L, 0);
         else
             lua_pushinteger(L, m_memory[addr+i]);
@@ -1388,7 +1395,7 @@ int peek2(lua_State *L)
     luaL_checkstack(L, n, "too many values");
 
     for (unsigned i=0;i<n;++i) {
-        if (i >= (MEMORY_SIZE - addr) / 2)
+        if (addr >= MEMORY_SIZE || i >= (MEMORY_SIZE - addr) / 2)
             lua_pushinteger(L, 0);
         else
             lua_pushinteger(L, (m_memory[addr + i*2 + 1] << 8) | (m_memory[addr + i*2]));
@@ -1408,7 +1415,7 @@ int peek4(lua_State *L)
     luaL_checkstack(L, n, "too many values");
 
     for (unsigned i=0;i<n;++i) {
-        if (i >= (MEMORY_SIZE - addr) / 4)
+        if (addr >= MEMORY_SIZE || i >= (MEMORY_SIZE - addr) / 4)
             lua_pushinteger(L, 0);
         else
             lua_pushnumber(L, fix32_from_bits((m_memory[addr + i*4 + 3] << 24) | (m_memory[addr + i*4 + 2] << 16) | (m_memory[addr + i*4 + 1] << 8) | m_memory[addr + i*4]));
@@ -1449,7 +1456,7 @@ int poke(lua_State *L)
         if (addr == 0xffff || (int)addr == -1) {
             push_poke_fifo(val & 0xff);
         }
-        else if ((unsigned)(i - 2) < MEMORY_SIZE - addr) {
+        else if (addr < MEMORY_SIZE && (unsigned)(i - 2) < MEMORY_SIZE - addr) {
             m_memory[addr + i-2] = val;
         }
     }
@@ -1471,7 +1478,7 @@ int poke2(lua_State *L)
     for (int i=2;i<=lua_gettop(L);++i) {
         unsigned val = lua_tounsigned(L, i);
 
-        if ((unsigned)(i - 2) < (MEMORY_SIZE - addr) / 2) {
+        if (addr < MEMORY_SIZE && (unsigned)(i - 2) < (MEMORY_SIZE - addr) / 2) {
             m_memory[addr + (i-2)*2] = val;
             m_memory[addr + (i-2)*2 + 1] = val >> 8;
         }
@@ -1494,7 +1501,7 @@ int poke4(lua_State *L)
     for (int i=2;i<=lua_gettop(L);++i) {
         uint32_t val = lua_tonumber(L, i);
 
-        if ((unsigned)(i - 2) < (MEMORY_SIZE - addr) / 4) {
+        if (addr < MEMORY_SIZE && (unsigned)(i - 2) < (MEMORY_SIZE - addr) / 4) {
             m_memory[addr + (i-2)*4] = val;
             m_memory[addr + (i-2)*4 + 1] = val >> 8;
             m_memory[addr + (i-2)*4 + 2] = val >> 16;
