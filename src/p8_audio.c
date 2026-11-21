@@ -378,7 +378,7 @@ void update_sound_queue()
 
             if (sound->index == -1)
             {
-                if (sound->channel >= 0 && sound->channel <= CHANNEL_COUNT)
+                if (sound->channel >= 0 && sound->channel < CHANNEL_COUNT)
                     m_channels[sound->channel].sound_mode = SOUNDMODE_NONE;
                 continue;
             }
@@ -427,7 +427,7 @@ void update_sound_queue()
                 
                 sound->channel = best_channel;
             }
-            if (sound->channel >= 0 && sound->channel < CHANNEL_COUNT && sound->index >= 0 && sound->index <= SOUND_COUNT)
+            if (sound->channel >= 0 && sound->channel < CHANNEL_COUNT && sound->index >= 0 && sound->index < SOUND_COUNT)
             {
                 soundstate_t *channel = &m_channels[sound->channel];
                 uint8_t speed = m_memory[MEMORY_SFX + 68 * sound->index + 64 + 1];

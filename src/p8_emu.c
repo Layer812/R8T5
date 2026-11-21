@@ -253,7 +253,7 @@ int p8_init()
     if (!m_memory) {
         m_memory = (uint8_t *)rh_malloc(MEMORY_SIZE);
         if (!m_memory) {
-            printf("FATAL: Failed to allocate m_memory (32KB)\n");
+            printf("FATAL: Failed to allocate m_memory (64KB)\n");
         }
     }
 #ifdef OS_FREERTOS
@@ -517,6 +517,16 @@ int p8_init_file_with_param(const char *file_name, const char *param)
                 // ここで確実にポインタを渡す
                 lua_script = sd_inst;
                 patched_script_to_free = sd_inst;
+                // The patched Lua is on SD. Release the original PNG decode
+                // buffer before allocating Lua parser / AST data.
+                if (file_buffer) {
+#ifdef OS_FREERTOS
+                    rh_free(file_buffer);
+#else
+                    free(file_buffer);
+#endif
+                    file_buffer = NULL;
+                }
                 // ==========================================
 
             } else {

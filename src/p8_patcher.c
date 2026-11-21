@@ -3,6 +3,8 @@
 #include <string.h>
 #include <stdbool.h>
 #include "p8_patcher.h"
+#include <errno.h>
+#include "r8t5_terra_r2_embedded.h"
 
 #ifdef OS_FREERTOS
 extern void *rh_malloc(size_t size);
@@ -31,21 +33,14 @@ static void sb_append(StringBuilder *sb, const char *str, size_t len) {
     if (!sb->data) return;
     if (sb->length + len + 1 > sb->capacity) {
         sb->capacity = (sb->length + len + 1) * 2;
-        char *new_data = (char *)rh_realloc(sb->data, sb->capacity);
-        if (!new_data) {
-            // rh_realloc 失敗時: C標準仕様により元の sb->data は解放されておらず有効。
-            // sb->data を直接上書きするとポインタが消滅してメモリリークになるため
-            // 一時変数で受け取り、失敗した場合は元の状態を保ったまま早期リターン。
-            sb->capacity = sb->length; // 現状のサイズに戻して整合性を保つ
-            return;
-        }
-        sb->data = new_data;
+        sb->data = (char *)rh_realloc(sb->data, sb->capacity);
     }
-    memcpy(sb->data + sb->length, str, len);
-    sb->length += len;
-    sb->data[sb->length] = '\0';
+    if (sb->data) {
+        memcpy(sb->data + sb->length, str, len);
+        sb->length += len;
+        sb->data[sb->length] = '\0';
+    }
 }
-
 
 // UTF-8の絵文字をP8SCIIの1バイトコードに置換する関数
 static void replace_emoji_with_p8scii(char *str, const char *emoji, char p8scii_char) {
@@ -94,22 +89,43 @@ static const char *find_match(const char *haystack, const char *needle, size_t *
 }
 
 char *apply_p8t_patch(const char *old_script, const char *p8t_path) {
+    long p8t_len = 0;
+    char *p8t_buf = NULL;
     FILE *f = fopen(p8t_path, "rb");
-    if (!f) return NULL;
-
-    fseek(f, 0, SEEK_END);
-    long p8t_len = ftell(f);
-    rewind(f);
-
-    if (p8t_len <= 0) {
+    if (f) {
+        if (fseek(f, 0, SEEK_END) == 0) {
+            p8t_len = ftell(f);
+            rewind(f);
+            if (p8t_len > 0 && p8t_len <= 1048576) {
+                p8t_buf = (char *)rh_malloc((size_t)p8t_len + 1);
+                if (p8t_buf && fread(p8t_buf, 1, (size_t)p8t_len, f) != (size_t)p8t_len) {
+                    rh_free(p8t_buf);
+                    p8t_buf = NULL;
+                }
+            }
+        }
         fclose(f);
-        return NULL;
     }
-
-    char *p8t_buf = (char *)rh_malloc(p8t_len + 1);
-    fread(p8t_buf, 1, p8t_len, f);
+    if (p8t_buf) p8t_buf[p8t_len] = '\0';
+    const char *patch_name = strrchr(p8t_path, '/');
+    patch_name = patch_name ? patch_name + 1 : p8t_path;
+    if (strcmp(patch_name, "terra_1cart-44.p8t") == 0) {
+        const bool old_patch = p8t_buf &&
+            strstr(p8t_buf, "54k no-op calls removed") &&
+            !strstr(p8t_buf, "r8_terra_music_toggle");
+        if (!p8t_buf || old_patch) {
+            const size_t new_len = sizeof(r8t5_terra_r2_embedded_p8t) - 1;
+            char *new_buf = (char *)rh_malloc(new_len + 1);
+            if (new_buf) {
+                memcpy(new_buf, r8t5_terra_r2_embedded_p8t, new_len + 1);
+                if (p8t_buf) rh_free(p8t_buf);
+                p8t_buf = new_buf;
+                p8t_len = (long)new_len;
+            }
+        }
+    }
+    if (!p8t_buf) return NULL;
     p8t_buf[p8t_len] = '\0';
-    fclose(f);
 
     // ==========================================
     // UTF-8絵文字をバイトコードで直接指定して置換
@@ -135,13 +151,21 @@ char *apply_p8t_patch(const char *old_script, const char *p8t_path) {
         start_ptr += 3;
     }
 
-    // Make a mutable copy of old_script to work with
     size_t old_len = strlen(old_script);
-    char *script_buf = (char *)rh_malloc(old_len + 1);
-    memcpy(script_buf, old_script, old_len + 1);
-
-    // Apply patches sequentially
-    char *current_script = script_buf;
+    if (p8t_len <= 0 || (size_t)p8t_len > (size_t)-1 - old_len - 1) {
+        rh_free(p8t_buf);
+        return NULL;
+    }
+    const size_t script_capacity = old_len + (size_t)p8t_len + 1;
+    char *current_script = (char *)rh_malloc(script_capacity);
+    if (!current_script) {
+        rh_free(p8t_buf);
+        return NULL;
+    }
+    memcpy(current_script, old_script, old_len + 1);
+    size_t current_length = old_len;
+    unsigned matched_blocks = 0;
+    unsigned total_blocks = 0;
 
     char *line = start_ptr;
     while (line && *line) {
@@ -170,38 +194,36 @@ char *apply_p8t_patch(const char *old_script, const char *p8t_path) {
                     break;
                 }
 
-                int len = strlen(line);
-                if (len > 0 && line[len - 1] == '\r') {
-                    line[len - 1] = '\0';
-                    len--;
-                }
-
                 if (state == 0) {
-                    sb_append(&search_sb, line, len);
+                    sb_append(&search_sb, line, strlen(line));
                     sb_append(&search_sb, "\n", 1);
                 } else {
-                    sb_append(&replace_sb, line, len);
+                    sb_append(&replace_sb, line, strlen(line));
                     sb_append(&replace_sb, "\n", 1);
                 }
             }
 
             if (block_closed && search_sb.length > 0) {
+                ++total_blocks;
                 size_t match_len = 0;
                 const char *match = find_match(current_script, search_sb.data, &match_len);
                 if (match) {
-                    StringBuilder new_script;
-                    sb_init(&new_script);
-
-                    // Append prefix
-                    sb_append(&new_script, current_script, match - current_script);
-                    // Append replacement
-                    sb_append(&new_script, replace_sb.data, replace_sb.length);
-                    // Append suffix
-                    const char *suffix = match + match_len;
-                    sb_append(&new_script, suffix, strlen(suffix));
-
-                    rh_free(current_script);
-                    current_script = new_script.data;
+                    const size_t pos = (size_t)(match - current_script);
+                    const size_t added = replace_sb.length;
+                    if (pos > current_length || match_len > current_length - pos ||
+                        added > script_capacity - 1 - (current_length - match_len)) {
+                        rh_free(search_sb.data);
+                        rh_free(replace_sb.data);
+                        rh_free(p8t_buf);
+                        rh_free(current_script);
+                        return NULL;
+                    }
+                    const size_t tail = current_length - pos - match_len;
+                    memmove(current_script + pos + added,
+                            current_script + pos + match_len, tail + 1);
+                    memcpy(current_script + pos, replace_sb.data, added);
+                    current_length = current_length - match_len + added;
+                    ++matched_blocks;
                 } else {
                     printf("Patch warning: Could not find SEARCH block:\n%s\n", search_sb.data);
                 }
@@ -215,5 +237,10 @@ char *apply_p8t_patch(const char *old_script, const char *p8t_path) {
     }
 
     rh_free(p8t_buf);
+    if (strcmp(patch_name, "terra_1cart-44.p8t") == 0 &&
+        (total_blocks != 4 || matched_blocks != 4)) {
+        rh_free(current_script);
+        return NULL;
+    }
     return current_script;
 }
