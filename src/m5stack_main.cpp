@@ -22,29 +22,52 @@ static bool ppa_present_region_scaled(int x, int y, int dst_width, int dst_heigh
 static uint16_t* scaled_buf = nullptr;
 static int src_idx[720];
 
+static bool ppa_present_staged_scaled(const uint16_t *frame_buffer, uint16_t *output_buffer);
+
 void flipTask(void *pvParameters) {
-    // スケーリング用の座標テーブルを事前計算
-    for(int i = 0; i < 720; i++) {
+    for (int i = 0; i < 720; ++i) {
         src_idx[i] = (i * 128) / 720;
     }
-    // PSRAMに720x720の拡大用バッファを確保
-    scaled_buf = (uint16_t*)heap_caps_malloc(720 * 720 * 2, MALLOC_CAP_SPIRAM);
 
-    while (1) {
+    constexpr size_t scaled_bytes = 720 * 720 * sizeof(uint16_t);
+    scaled_buf = (uint16_t *)heap_caps_aligned_alloc(
+        128, scaled_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!scaled_buf) {
+        scaled_buf = (uint16_t *)heap_caps_malloc(scaled_bytes, MALLOC_CAP_SPIRAM);
+    }
+
+    int last_present_mode = -1;
+    while (true) {
         xSemaphoreTake(flipSem, portMAX_DELAY);
-        if (render_idx >= 0 && line_buffer[0] != NULL && scaled_buf != NULL) {
-            uint16_t* src = line_buffer[render_idx];
+        if (render_idx >= 0 && line_buffer[render_idx] != nullptr) {
+            const uint16_t *src = line_buffer[render_idx];
+            M5.Display.waitDMA();
 
-            // Core 0 のパワーで一気に配列をコピー（超高速スケーリング）
-            for (int y = 0; y < 720; y++) {
-                uint16_t* src_row = &src[src_idx[y] * 128];
-                uint16_t* dst_row = &scaled_buf[y * 720];
-                for (int x = 0; x < 720; x++) {
-                    dst_row[x] = src_row[src_idx[x]];
+            int present_mode = -1;
+            if (ppa_present_region_scaled(g_render_x, g_render_y, 720, 720, 128, 128, src)) {
+                present_mode = 2;
+            } else if (scaled_buf) {
+                if (ppa_present_staged_scaled(src, scaled_buf)) {
+                    present_mode = 1;
+                } else {
+                    for (int y = 0; y < 720; ++y) {
+                        const uint16_t *src_row = &src[src_idx[y] * 128];
+                        uint16_t *dst_row = &scaled_buf[y * 720];
+                        for (int x = 0; x < 720; ++x) {
+                            dst_row[x] = src_row[src_idx[x]];
+                        }
+                    }
+                    present_mode = 0;
                 }
+                M5.Display.pushImageDMA(g_render_x, g_render_y, 720, 720, scaled_buf);
             }
-            // 拡大済みの画像をDMA転送
-            M5.Display.pushImageDMA(g_render_x, g_render_y, 720, 720, scaled_buf);
+            if (present_mode != last_present_mode) {
+                const char *name = present_mode == 2 ? "direct"
+                                 : present_mode == 1 ? "staged"
+                                 : present_mode == 0 ? "cpu" : "unavailable";
+                printf("[R8T5] renderer: %s\n", name);
+                last_present_mode = present_mode;
+            }
         }
         render_idx = 1 - render_idx;
         xSemaphoreGive(doneSem);
@@ -58,6 +81,7 @@ void flipTask(void *pvParameters) {
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <driver/ppa.h>
+#include <esp_heap_caps.h>
 #include <lgfx/v1/platforms/esp32p4/Panel_DSI.hpp>
 
 // PPA (Pixel Processing Accelerator) parameters for Tab5
@@ -67,9 +91,11 @@ static uint32_t s_dsi_fb_bytes = 0;
 static int s_phys_w = 0;
 static int s_phys_h = 0;
 static bool s_ppa_ready = false;
+static bool s_ppa_direct_enabled = false;
 
 static void init_ppa_fast_present(void) {
     s_ppa_ready = false;
+    s_ppa_direct_enabled = false;
     s_dsi_fb = nullptr;
     auto *panel_dev = M5.Display.getPanel();
     if (!panel_dev) return;
@@ -79,10 +105,13 @@ static void init_ppa_fast_present(void) {
     const auto cfg = dsi->config();
     if (!detail.buffer || cfg.panel_width <= 0 || cfg.panel_height <= 0) return;
 
+    const uint64_t needed_bytes = (uint64_t)cfg.panel_width * cfg.panel_height * sizeof(uint16_t);
+    if (needed_bytes == 0 || needed_bytes > UINT32_MAX) return;
+
     s_dsi_fb = static_cast<uint16_t *>(detail.buffer);
     s_phys_w = cfg.panel_width;
     s_phys_h = cfg.panel_height;
-    s_dsi_fb_bytes = (uint32_t)s_phys_w * (uint32_t)s_phys_h * sizeof(uint16_t);
+    s_dsi_fb_bytes = (uint32_t)needed_bytes;
 
     ppa_client_config_t client_cfg = {};
     client_cfg.oper_type = PPA_OPERATION_SRM;
@@ -92,39 +121,87 @@ static void init_ppa_fast_present(void) {
         s_ppa_srm = nullptr;
         return;
     }
+
     s_ppa_ready = true;
+    s_ppa_direct_enabled =
+        ((uintptr_t)s_dsi_fb % 128) == 0 &&
+        (s_dsi_fb_bytes % 128) == 0;
 }
 
-static bool ppa_present_region_scaled(int x, int y, int dst_width, int dst_height, int src_width, int src_height, const uint16_t *frame_buffer) {
-    if (!s_ppa_ready || !s_ppa_srm || !s_dsi_fb || !frame_buffer) return false;
-    
-    const int logical_w = M5.Display.width();
-    const int logical_h = M5.Display.height();
-    const int out_x = logical_h - (y + dst_height);
-    const int out_y = x;
-    if (out_x < 0 || out_y < 0 || out_x + dst_height > s_phys_w || out_y + dst_width > s_phys_h) return false;
-
+static esp_err_t ppa_scale_rgb565(
+        const uint16_t *source, int src_width, int src_height,
+        uint16_t *destination, uint32_t destination_bytes,
+        int pic_width, int pic_height,
+        int offset_x, int offset_y,
+        float scale_x, float scale_y,
+        ppa_srm_rotation_angle_t rotation) {
     ppa_srm_oper_config_t op = {};
-    op.in.buffer = (const void *)frame_buffer;
+    op.in.buffer = source;
     op.in.pic_w = src_width;
     op.in.pic_h = src_height;
     op.in.block_w = src_width;
     op.in.block_h = src_height;
     op.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-    
-    op.out.buffer = (void *)s_dsi_fb;
-    op.out.pic_w = s_phys_w;
-    op.out.pic_h = s_phys_h;
-    op.out.block_offset_x = out_x;
-    op.out.block_offset_y = out_y;
+
+    op.out.buffer = destination;
+    op.out.buffer_size = destination_bytes;
+    op.out.pic_w = pic_width;
+    op.out.pic_h = pic_height;
+    op.out.block_offset_x = offset_x;
+    op.out.block_offset_y = offset_y;
     op.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
 
-    op.rotation_angle = PPA_SRM_ROTATION_ANGLE_270;
-    op.scale_x = (float)dst_height / src_height;
-    op.scale_y = (float)dst_width / src_width;
-
-    return ppa_do_scale_rotate_mirror(s_ppa_srm, &op) == ESP_OK;
+    op.rotation_angle = rotation;
+    op.scale_x = scale_x;
+    op.scale_y = scale_y;
+    op.mode = PPA_TRANS_MODE_BLOCKING;
+    return ppa_do_scale_rotate_mirror(s_ppa_srm, &op);
 }
+
+static bool ppa_present_region_scaled(int x, int y, int dst_width, int dst_height,
+                                      int src_width, int src_height, const uint16_t *frame_buffer) {
+    if (!s_ppa_ready || !s_ppa_direct_enabled || !s_dsi_fb || !frame_buffer) return false;
+
+    const int logical_h = M5.Display.height();
+    const int out_x = logical_h - (y + dst_height);
+    const int out_y = x;
+    if (out_x < 0 || out_y < 0 || out_x + dst_height > s_phys_w ||
+        out_y + dst_width > s_phys_h) {
+        s_ppa_direct_enabled = false;
+        return false;
+    }
+
+    esp_err_t result = ppa_scale_rgb565(
+        frame_buffer, src_width, src_height,
+        s_dsi_fb, s_dsi_fb_bytes, s_phys_w, s_phys_h,
+        out_x, out_y,
+        (float)dst_height / src_height, (float)dst_width / src_width,
+        PPA_SRM_ROTATION_ANGLE_270);
+
+    if (result != ESP_OK) {
+        printf("[R8T5] direct PPA failed: 0x%x\n", (unsigned)result);
+        s_ppa_direct_enabled = false;
+    }
+    return result == ESP_OK;
+}
+
+static bool ppa_present_staged_scaled(const uint16_t *frame_buffer, uint16_t *output_buffer) {
+    if (!s_ppa_ready || !frame_buffer || !output_buffer ||
+        ((uintptr_t)output_buffer % 128) != 0) return false;
+
+    esp_err_t result = ppa_scale_rgb565(
+        frame_buffer, 128, 128, output_buffer,
+        720 * 720 * sizeof(uint16_t), 720, 720, 0, 0,
+        720.0f / 128.0f, 720.0f / 128.0f,
+        PPA_SRM_ROTATION_ANGLE_0);
+
+    if (result != ESP_OK) {
+        printf("[R8T5] staged PPA failed: 0x%x\n", (unsigned)result);
+        s_ppa_ready = false;
+    }
+    return result == ESP_OK;
+}
+
 #include <Preferences.h>
 #include <math.h>
 // // #include <Bluepad32.h>
