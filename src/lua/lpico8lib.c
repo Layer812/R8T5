@@ -340,12 +340,10 @@ static int pico8_ord(lua_State *l) {
 
 static int pico8_split(lua_State *l) {
     size_t count = 0, hlen;
-    char const *haystack;
+    const char *haystack;
     int size = 0;
     char needle = ',';
     int convert;
-    char const *end;
-    char const *parser;
 
     if (lua_isnil(l, 1)) {
         return 0;
@@ -353,8 +351,10 @@ static int pico8_split(lua_State *l) {
     haystack = luaL_checklstring(l, 1, &hlen);
     if (!haystack)
         return 0;
-    lua_newtable(l);
-    /* Split either by chunk size or by needle position */
+
+    /* Do not modify lua_tolstring()'s interned bytes, not even briefly:
+     * lua_pushlstring() may allocate/GC while the original string is
+     * temporarily changed, corrupting Lua string-table lookups. */
     if (lua_isnumber(l, 2)) {
         size = fix32_to_int(lua_tonumber(l, 2));
         if (size <= 0)
@@ -363,21 +363,43 @@ static int pico8_split(lua_State *l) {
         needle = *lua_tostring(l, 2);
     }
     convert = lua_isnone(l, 3) || lua_toboolean(l, 3);
-    end = haystack + hlen + (!size && needle);
-    for (parser = haystack; parser < end; ) {
-        lua_Number num;
-        char const *next = size ? parser + size
-                         : needle ? (char const*)memchr(parser, needle, (size_t)(end - parser)) : parser + 1;
-        char saved;
-        if (!next || next > end)
-            next = haystack + hlen;
-        saved = *next; /* temporarily put a null terminator here */
-        *(char *)next = '\0';
-        if (convert && luaO_str2d(parser, (size_t)(next - parser), &num))
+
+    lua_newtable(l);
+    const char *end = haystack + hlen + (!size && needle);
+    for (const char *parser = haystack; parser < end; ) {
+        const char *next;
+        if (size) {
+            const size_t available = (size_t)(end - parser);
+            const size_t chunk = (size_t)size < available ? (size_t)size : available;
+            next = parser + chunk;
+        } else if (needle) {
+            next = (const char *)memchr(parser, needle, (size_t)(end - parser));
+            if (!next) next = haystack + hlen;
+        } else {
+            next = parser + 1;
+        }
+
+        const size_t len = (size_t)(next - parser);
+        int is_numeric = 0;
+        lua_Number num = 0;
+        if (convert) {
+            char local[64];
+            char *token = local;
+            if (len >= sizeof(local)) {
+                token = (char *)malloc(len + 1);
+                if (!token)
+                    return luaL_error(l, "out of memory in split");
+            }
+            memcpy(token, parser, len);
+            token[len] = '\0';
+            is_numeric = luaO_str2d(token, len, &num);
+            if (token != local) free(token);
+        }
+
+        if (is_numeric)
             lua_pushnumber(l, num);
         else
-            lua_pushlstring(l, parser, (size_t)(next - parser));
-        *(char *)next = saved;
+            lua_pushlstring(l, parser, len);
         lua_rawseti(l, -2, (int)(++count));
         parser = next + (!size && needle);
     }
