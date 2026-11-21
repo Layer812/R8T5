@@ -1305,13 +1305,16 @@ int _memcpy(lua_State *L)
         return 1;
     }
 
-    if (sourceaddr >= 0x8000 || (sourceaddr + len) > 0x8000)
+    // PICO-8 addresses are 16-bit, including signed forms of 0x8000..0xffff.
+    sourceaddr &= (MEMORY_SIZE - 1);
+    destaddr &= (MEMORY_SIZE - 1);
+    if (len > MEMORY_SIZE - sourceaddr)
     {
         lua_pushinteger(L, orig_destaddr);
         return 1;
     }
 
-    if (destaddr >= 0x8000 || (destaddr + len) > 0x8000)
+    if (len > MEMORY_SIZE - destaddr)
     {
         lua_pushinteger(L, orig_destaddr);
         return 1;
@@ -1321,6 +1324,11 @@ int _memcpy(lua_State *L)
         unsigned chunk = MIN(MIN(len, 0x2000 - (sourceaddr & 0x1fff)), 0x2000 - (destaddr & 0x1fff));
         unsigned destaddr1 = addr_remap(destaddr);
         unsigned sourceaddr1 = addr_remap(sourceaddr);
+        if (destaddr1 >= MEMORY_SIZE || sourceaddr1 >= MEMORY_SIZE ||
+            chunk > MEMORY_SIZE - destaddr1 || chunk > MEMORY_SIZE - sourceaddr1) {
+            lua_pushinteger(L, orig_destaddr);
+            return 1;
+        }
         memmove(m_memory + destaddr1, m_memory + sourceaddr1, chunk);
         destaddr += chunk;
         sourceaddr += chunk;
@@ -1338,13 +1346,16 @@ int _memset(lua_State *L)
     int val = lua_tointeger(L, 2);
     unsigned len = lua_tounsigned(L, 3);
 
-    if (destaddr >= 0x8000 || destaddr + len > 0x8000) {
+    destaddr &= (MEMORY_SIZE - 1);
+    if (len > MEMORY_SIZE - destaddr) {
         return 0;
     }
 
     while (len > 0) {
         unsigned chunk = MIN(len, 0x2000 - (destaddr & 0x1fff));
         unsigned destaddr1 = addr_remap(destaddr);
+        if (destaddr1 >= MEMORY_SIZE || chunk > MEMORY_SIZE - destaddr1)
+            return 0;
         memset(m_memory + destaddr1, val, chunk);
         destaddr += chunk;
         len -= chunk;
@@ -1356,7 +1367,7 @@ int _memset(lua_State *L)
 // peek(addr, [n])
 int peek(lua_State *L)
 {
-    unsigned addr = lua_tounsigned(L, 1);
+    unsigned addr = lua_tounsigned(L, 1) & (MEMORY_SIZE - 1);
     unsigned n = lua_gettop(L) >= 2 ? lua_tounsigned(L, 2) : 1;
 
     addr = addr_remap(addr);
@@ -1364,7 +1375,7 @@ int peek(lua_State *L)
     luaL_checkstack(L, n, "too many values");
 
     for (unsigned i=0;i<n;++i) {
-        if (addr + i >= 0x8000)
+        if (addr >= MEMORY_SIZE || i >= MEMORY_SIZE - addr)
             lua_pushinteger(L, 0);
         else
             lua_pushinteger(L, m_memory[addr+i]);
@@ -1376,7 +1387,7 @@ int peek(lua_State *L)
 // peek2(addr, [n])
 int peek2(lua_State *L)
 {
-    unsigned addr = lua_tounsigned(L, 1);
+    unsigned addr = lua_tounsigned(L, 1) & (MEMORY_SIZE - 1);
     unsigned n = lua_gettop(L) >= 2 ? lua_tounsigned(L, 2) : 1;
 
     addr = addr_remap(addr);
@@ -1384,7 +1395,7 @@ int peek2(lua_State *L)
     luaL_checkstack(L, n, "too many values");
 
     for (unsigned i=0;i<n;++i) {
-        if (addr + i*2 + 1 >= 0x8000)
+        if (addr >= MEMORY_SIZE || i >= (MEMORY_SIZE - addr) / 2)
             lua_pushinteger(L, 0);
         else
             lua_pushinteger(L, (m_memory[addr + i*2 + 1] << 8) | (m_memory[addr + i*2]));
@@ -1396,7 +1407,7 @@ int peek2(lua_State *L)
 // peek4(addr, [n])
 int peek4(lua_State *L)
 {
-    unsigned addr = lua_tounsigned(L, 1);
+    unsigned addr = lua_tounsigned(L, 1) & (MEMORY_SIZE - 1);
     unsigned n = lua_gettop(L) >= 2 ? lua_tounsigned(L, 2) : 1;
 
     addr = addr_remap(addr);
@@ -1404,7 +1415,7 @@ int peek4(lua_State *L)
     luaL_checkstack(L, n, "too many values");
 
     for (unsigned i=0;i<n;++i) {
-        if (addr + i*4 + 3 >= 0x8000)
+        if (addr >= MEMORY_SIZE || i >= (MEMORY_SIZE - addr) / 4)
             lua_pushinteger(L, 0);
         else
             lua_pushnumber(L, fix32_from_bits((m_memory[addr + i*4 + 3] << 24) | (m_memory[addr + i*4 + 2] << 16) | (m_memory[addr + i*4 + 1] << 8) | m_memory[addr + i*4]));
@@ -1435,7 +1446,7 @@ static int pop_poke_fifo(uint8_t *val) {
 // poke(addr, val1, ...)
 int poke(lua_State *L)
 {
-    unsigned addr = lua_tounsigned(L, 1);
+    unsigned addr = lua_tounsigned(L, 1) & (MEMORY_SIZE - 1);
 
     addr = addr_remap(addr);
 
@@ -1445,7 +1456,7 @@ int poke(lua_State *L)
         if (addr == 0xffff || (int)addr == -1) {
             push_poke_fifo(val & 0xff);
         }
-        else if (addr + i - 2 < 0x8000) {
+        else if (addr < MEMORY_SIZE && (unsigned)(i - 2) < MEMORY_SIZE - addr) {
             m_memory[addr + i-2] = val;
         }
     }
@@ -1460,14 +1471,14 @@ int poke(lua_State *L)
 // poke2(addr, val1, ...)
 int poke2(lua_State *L)
 {
-    unsigned addr = lua_tounsigned(L, 1);
+    unsigned addr = lua_tounsigned(L, 1) & (MEMORY_SIZE - 1);
 
     addr = addr_remap(addr);
 
     for (int i=2;i<=lua_gettop(L);++i) {
         unsigned val = lua_tounsigned(L, i);
 
-        if (addr + (i - 2) * 2 + 1 < 0x8000) {
+        if (addr < MEMORY_SIZE && (unsigned)(i - 2) < (MEMORY_SIZE - addr) / 2) {
             m_memory[addr + (i-2)*2] = val;
             m_memory[addr + (i-2)*2 + 1] = val >> 8;
         }
@@ -1483,14 +1494,14 @@ int poke2(lua_State *L)
 // poke4(addr, val1, ...)
 int poke4(lua_State *L)
 {
-    unsigned addr = lua_tounsigned(L, 1);
+    unsigned addr = lua_tounsigned(L, 1) & (MEMORY_SIZE - 1);
 
     addr = addr_remap(addr);
 
     for (int i=2;i<=lua_gettop(L);++i) {
         uint32_t val = lua_tonumber(L, i);
 
-        if (addr + (i - 2) * 4 + 3 < 0x8000) {
+        if (addr < MEMORY_SIZE && (unsigned)(i - 2) < (MEMORY_SIZE - addr) / 4) {
             m_memory[addr + (i-2)*4] = val;
             m_memory[addr + (i-2)*4 + 1] = val >> 8;
             m_memory[addr + (i-2)*4 + 2] = val >> 16;
@@ -1513,7 +1524,7 @@ int reload(lua_State *L)
     unsigned orig_destaddr = destaddr;
     unsigned srcaddr  = nargs >= 2 ? lua_tounsigned(L, 2) : 0;
     unsigned len      = nargs >= 3 ? lua_tounsigned(L, 3) : 0x4300;
-    destaddr = addr_remap(destaddr);
+    destaddr = addr_remap(destaddr & (MEMORY_SIZE - 1));
     const char *file_name = nargs >= 4 ? lua_tostring(L, 4) : NULL;
     uint8_t *src_mem = NULL;
     if (file_name != NULL) {
@@ -1545,7 +1556,8 @@ int reload(lua_State *L)
     } else {
         src_mem = m_memory;
     }
-    if (destaddr >= 0 && destaddr + len <= 0x8000 && srcaddr >= 0 && srcaddr + len <= CART_MEMORY_SIZE)
+    if (destaddr < MEMORY_SIZE && len <= MEMORY_SIZE - destaddr &&
+        srcaddr < CART_MEMORY_SIZE && len <= CART_MEMORY_SIZE - srcaddr)
         memcpy(m_memory + destaddr, src_mem + srcaddr, len);
     if (file_name != NULL) {
         free(src_mem);
