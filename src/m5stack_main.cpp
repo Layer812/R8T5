@@ -687,28 +687,97 @@ extern "C" void m5stack_resume_frame_buf(void)  {}
 // ---------------------------------------------------------------------------
 // レンダリングの超高速化と画面サイズの縮小
 // ---------------------------------------------------------------------------
+// Decode the PICO-8 8-bit display palette into the 32-color RGB565 table.
+// Bits 0..3 select a color; bit 7 selects the extended palette (16..31).
+static inline uint16_t r8t5_rgb565(uint8_t palette_color) {
+    return m_colors[((palette_color >> 3) & 0x10) | (palette_color & 0x0f)];
+}
+
+static inline void r8t5_transform_pixel(uint8_t mode, int ox, int oy, int &sx, int &sy) {
+    sx = ox; sy = oy;
+    switch (mode) {
+    case 1: sx = ox >> 1; break;
+    case 2: sy = oy >> 1; break;
+    case 3: sx = ox >> 1; sy = oy >> 1; break;
+    case 5: sx = (ox < 64) ? ox : 127 - ox; break;
+    case 6: sy = (oy < 64) ? oy : 127 - oy; break;
+    case 7: sx = (ox < 64) ? ox : 127 - ox;
+            sy = (oy < 64) ? oy : 127 - oy; break;
+    case 129: sx = 127 - ox; break;
+    case 130: sy = 127 - oy; break;
+    case 131: case 134: sx = 127 - ox; sy = 127 - oy; break;
+    case 133: sx = 127 - oy; sy = ox; break;
+    case 135: sx = oy; sy = 127 - ox; break;
+    }
+}
+
 extern "C" void p8_render()
 {
-    if (!m_memory || !line_buffer[0]) return;
-    uint8_t* vram = &m_memory[0x6000]; // VRAM starts at 0x6000
-
+    if (!m_memory || !line_buffer[0] || !doneSem || !flipSem) return;
     xSemaphoreTake(doneSem, portMAX_DELAY);
     M5.update(); // SAFE ZONE for I2C
 
-    // 出力先バッファのポインタ
     uint16_t* dest = line_buffer[render_idx];
+    if (!dest) { xSemaphoreGive(doneSem); return; }
 
-    // if文と割り算を排除した超高速ループ (2ピクセル同時処理)
-    // 128x128固定出力、PPAが720x720にハードウェアスケーリング
-    for (int y = 0; y < 128; y++) {
-        int y_offset = y * 64;
-        for (int x = 0; x < 64; x++) {
-            uint8_t pair = vram[y_offset + x];
-            *dest++ = m_colors[pair & 0x0F];
-            *dest++ = m_colors[pair >> 4];
+    const uint8_t* screen_pal = m_memory + MEMORY_PALETTES + PALTYPE_SCREEN * 16;
+    uint16_t screen_colors[16];
+    uint16_t secondary_colors[16];
+    for (int i = 0; i < 16; ++i) {
+        screen_colors[i] = r8t5_rgb565(screen_pal[i]);
+        secondary_colors[i] = r8t5_rgb565(m_memory[MEMORY_PALETTE_SECONDARY + i]);
+    }
+    unsigned screen_base = (unsigned)m_memory[MEMORY_SCREEN_PHYS] << 8;
+    if (screen_base > MEMORY_SIZE - MEMORY_SCREEN_SIZE)
+        screen_base = MEMORY_SCREEN;
+    const uint8_t *vram = m_memory + screen_base;
+    const uint8_t transform = m_memory[MEMORY_SCREEN_TRANSFORM];
+    const uint8_t hc_mode = m_memory[MEMORY_HIGH_COLOUR_MODE];
+
+    if (transform == 0 && hc_mode == 0) {
+        // Unchanged 128x128 fast path: palette is a 16-entry local lookup.
+        for (int y = 0; y < 128; ++y) {
+            const uint8_t *src = vram + y * 64;
+            for (int x = 0; x < 64; ++x) {
+                const uint8_t pair = src[x];
+                *dest++ = screen_colors[pair & 0x0f];
+                *dest++ = screen_colors[pair >> 4];
+            }
+        }
+    } else {
+        // PICO-8 screen transforms and secondary/high-color palette modes.
+        for (int y = 0; y < 128; ++y) {
+            for (int x = 0; x < 128; ++x) {
+                int sx, sy;
+                r8t5_transform_pixel(transform, x, y, sx, sy);
+                const unsigned offs = (unsigned)sy * 64 + ((unsigned)sx >> 1);
+                const uint8_t pair = vram[offs];
+                const uint8_t pix = (sx & 1) ? pair >> 4 : pair & 0x0f;
+                uint16_t col = screen_colors[pix];
+                if (hc_mode == 0x10) {
+                    const uint8_t bits = m_memory[0x5f70 + (sy >> 3)];
+                    if (bits & (1u << (sy & 7))) col = secondary_colors[pix];
+                } else if (hc_mode == 0x20) {
+                    // Match the SDL implementation's hidden right-side bitplane.
+                    const unsigned hidden = screen_base + (unsigned)sy * 64 + ((unsigned)(sx + 64) >> 1);
+                    if (hidden < MEMORY_SIZE) {
+                        const uint8_t h = m_memory[hidden];
+                        const uint8_t hp = ((sx + 64) & 1) ? h >> 4 : h & 0x0f;
+                        if (hp) col = secondary_colors[pix];
+                    }
+                } else if ((hc_mode & 0xf0) == 0x30) {
+                    const uint8_t pal_index = screen_pal[pix];
+                    if ((pal_index & 0x0f) == (hc_mode & 0x0f)) {
+                        int section = sy >> 3;
+                        const uint8_t bits = m_memory[0x5f70 + (sy >> 3)];
+                        if (bits & (1u << (sy & 7))) section = (section + 1) & 15;
+                        col = secondary_colors[section];
+                    }
+                }
+                *dest++ = col;
+            }
         }
     }
-
     xSemaphoreGive(flipSem);
 }
 
