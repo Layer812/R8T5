@@ -903,7 +903,7 @@ static void r8t5_update_headphone_route()
         ? M5.In_I2C.bitOn(kExpander, kOutputState, kSpeakerAmpPin, kI2cHz)
         : M5.In_I2C.bitOff(kExpander, kOutputState, kSpeakerAmpPin, kI2cHz);
     if (ok)
-        Serial.printf("[R8T5] 3.5mm %s; built-in speaker %s\\n",
+        Serial.printf("[R8T5] 3.5mm %s; built-in speaker %s\n",
                       plugged ? "connected" : "disconnected",
                       want_speaker ? "ON" : "OFF");
 #endif
