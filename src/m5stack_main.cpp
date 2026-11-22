@@ -851,6 +851,64 @@ void load_selected_rom()
 // Arduino entry points
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Tab5 3.5 mm headphone jack: mute only the external speaker amplifier.
+// M5Unified already drives the ES8388 DAC outputs for both speaker/headphones.
+// E1 PI4IOE5V6408 (0x43): P7=HP_DET (high when inserted), P1=SPK_EN.
+// Do not restart the codec, Speaker task or I2S stream when switching.
+// ---------------------------------------------------------------------------
+static void r8t5_update_headphone_route()
+{
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+    static bool have_sample = false;
+    static bool candidate_plugged = false;
+    static uint32_t candidate_since_ms = 0;
+    static uint32_t last_poll_ms = 0;
+
+    const uint32_t now = millis();
+    if (have_sample && (uint32_t)(now - last_poll_ms) < 75) return;
+    last_poll_ms = now;
+
+    constexpr uint8_t kExpander = 0x43;
+    constexpr uint8_t kInputStatus = 0x0f;
+    constexpr uint8_t kOutputState = 0x05;
+    constexpr uint8_t kHeadphonePin = 0x80;
+    constexpr uint8_t kSpeakerAmpPin = 0x02;
+    constexpr uint32_t kI2cHz = 400000;
+
+    uint8_t input_status = 0;
+    // An I2C failure must not be mistaken for headphone removal.
+    if (!M5.In_I2C.readRegister(kExpander, kInputStatus, &input_status, 1, kI2cHz))
+        return;
+
+    const bool plugged = (input_status & kHeadphonePin) != 0;
+    if (!have_sample || plugged != candidate_plugged) {
+        have_sample = true;
+        candidate_plugged = plugged;
+        candidate_since_ms = now;
+    }
+    if ((uint32_t)(now - candidate_since_ms) < 150) return;
+
+    // M5Unified may re-enable SPK_EN on starting a new sound. Compare
+    // the real output latch and enforce headphone-only routing if needed.
+    uint8_t output_state = 0;
+    if (!M5.In_I2C.readRegister(kExpander, kOutputState, &output_state, 1, kI2cHz))
+        return;
+
+    const bool speaker_on = (output_state & kSpeakerAmpPin) != 0;
+    const bool want_speaker = !plugged && M5.Speaker.isEnabled();
+    if (speaker_on == want_speaker) return;
+
+    const bool ok = want_speaker
+        ? M5.In_I2C.bitOn(kExpander, kOutputState, kSpeakerAmpPin, kI2cHz)
+        : M5.In_I2C.bitOff(kExpander, kOutputState, kSpeakerAmpPin, kI2cHz);
+    if (ok)
+        Serial.printf("[R8T5] 3.5mm %s; built-in speaker %s\n",
+                      plugged ? "connected" : "disconnected",
+                      want_speaker ? "ON" : "OFF");
+#endif
+}
+
 void setup()
 {
     esp_log_level_set("*", ESP_LOG_NONE); // ログを無効化して高速化
@@ -957,6 +1015,8 @@ void process_volume_controls(uint16_t current_btn);
 
 void loop()
 {
+    r8t5_update_headphone_route();
+
     if (g_emulator_init_failed) {
         static bool shown = false;
         if (!shown) {
