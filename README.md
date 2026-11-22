@@ -1,4 +1,4 @@
-# RONTO8 for M5Stack Tab5 (v0.62)
+# RONTO8 for M5Stack Tab5 (v0.65)
 
 ![RONTO8 - Tab5](ront.gif)
 
@@ -46,9 +46,11 @@ RONTO8は、[**M5Stack Tab5**](https://docs.m5stack.com/ja/core/Tab5) 専用に�
 
 ### Via [M5Burner](https://docs.m5stack.com/en/uiflow/m5burner/intro) (Recommended)
 You can easily install RONTO8 using [M5Burner](https://docs.m5stack.com/en/uiflow/m5burner/intro) with the following share code:
+- **Version**: `v0.65` (Tab5 hardware-tested PPA DIRECT / Terra / headphone output)
 - **Share Code**: `1cfSQo0uWeTa33oH`
 
 [M5Burner](https://docs.m5stack.com/en/uiflow/m5burner/intro)のシェアコード検索から簡単にインストールできます：
+- **バージョン**: `v0.65`（PPA DIRECT・Terra・ヘッドフォン出力、Tab5実機確認済み）
 - **シェアコード**: `1cfSQo0uWeTa33oH`
 
 ### Building from Source / ソースからビルドする場合
