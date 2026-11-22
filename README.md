@@ -24,6 +24,15 @@ RONTO8は、[**M5Stack Tab5**](https://docs.m5stack.com/ja/core/Tab5) 専用に�
 - **Audio Support**: Enhanced audio synthesis for authentic PICO-8 SFX and Music playback.
   - PICO-8特有の効果音（SFX）やBGMを再現するオーディオエンジンを搭載。
 
+## ⚡ PPA DIRECT Renderer / PPA直接描画
+
+- **Tab5 hardware-tested (2026-11-22)**: ESP32-P4 PPA SRM scales/rotates RGB565 straight into the M5Unified/LovyanGFX `Panel_DSI` framebuffer. The maintainer observed approximately **2× faster rendering** than the previous CPU scaling path (workload-specific).
+- **Tab5実機で動作確認済み（2026-11-22）**: PPA SRMでRGB565を拡大・回転し、`Panel_DSI` の表示バッファへ直接描画。従来のCPU描画経路と比べて約**2倍の速度**を確認しました（利用条件による）。
+- **Working source / 実装コード**: [`src/m5stack_main.cpp`](src/m5stack_main.cpp), functions `init_ppa_fast_present()`, `ppa_scale_rgb565()`, `ppa_present_region_scaled()`, `flipTask()`.
+- **Detailed configuration / 詳細仕様**: [`docs/PPA_DIRECT_TAB5.md`](docs/PPA_DIRECT_TAB5.md) — framebuffer alignment, `op.out.buffer_size`, rotation/offsets, and `ESP_ERR_INVALID_ARG (0x102)` troubleshooting.
+- If the direct operation is unavailable or fails, the application falls back to staged PPA or CPU scaling. / PPA DIRECTが使用できない場合は段階的PPAまたはCPU描画にフォールバックします。
+
+---
 ## 🎮 Controls / 操作方法
 
 - **Touch Screen / タッチスクリーン**: A virtual gamepad is displayed on the screen. (画面上に仮想コントローラーが表示されます)
