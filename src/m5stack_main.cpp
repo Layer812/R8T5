@@ -22,29 +22,52 @@ static bool ppa_present_region_scaled(int x, int y, int dst_width, int dst_heigh
 static uint16_t* scaled_buf = nullptr;
 static int src_idx[720];
 
+static bool ppa_present_staged_scaled(const uint16_t *frame_buffer, uint16_t *output_buffer);
+
 void flipTask(void *pvParameters) {
-    // スケーリング用の座標テーブルを事前計算
-    for(int i = 0; i < 720; i++) {
+    for (int i = 0; i < 720; ++i) {
         src_idx[i] = (i * 128) / 720;
     }
-    // PSRAMに720x720の拡大用バッファを確保
-    scaled_buf = (uint16_t*)heap_caps_malloc(720 * 720 * 2, MALLOC_CAP_SPIRAM);
 
-    while (1) {
+    constexpr size_t scaled_bytes = 720 * 720 * sizeof(uint16_t);
+    scaled_buf = (uint16_t *)heap_caps_aligned_alloc(
+        128, scaled_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!scaled_buf) {
+        scaled_buf = (uint16_t *)heap_caps_malloc(scaled_bytes, MALLOC_CAP_SPIRAM);
+    }
+
+    int last_present_mode = -1;
+    while (true) {
         xSemaphoreTake(flipSem, portMAX_DELAY);
-        if (render_idx >= 0 && line_buffer[0] != NULL && scaled_buf != NULL) {
-            uint16_t* src = line_buffer[render_idx];
+        if (render_idx >= 0 && line_buffer[render_idx] != nullptr) {
+            const uint16_t *src = line_buffer[render_idx];
+            M5.Display.waitDMA();
 
-            // Core 0 のパワーで一気に配列をコピー（超高速スケーリング）
-            for (int y = 0; y < 720; y++) {
-                uint16_t* src_row = &src[src_idx[y] * 128];
-                uint16_t* dst_row = &scaled_buf[y * 720];
-                for (int x = 0; x < 720; x++) {
-                    dst_row[x] = src_row[src_idx[x]];
+            int present_mode = -1;
+            if (ppa_present_region_scaled(g_render_x, g_render_y, 720, 720, 128, 128, src)) {
+                present_mode = 2;
+            } else if (scaled_buf) {
+                if (ppa_present_staged_scaled(src, scaled_buf)) {
+                    present_mode = 1;
+                } else {
+                    for (int y = 0; y < 720; ++y) {
+                        const uint16_t *src_row = &src[src_idx[y] * 128];
+                        uint16_t *dst_row = &scaled_buf[y * 720];
+                        for (int x = 0; x < 720; ++x) {
+                            dst_row[x] = src_row[src_idx[x]];
+                        }
+                    }
+                    present_mode = 0;
                 }
+                M5.Display.pushImageDMA(g_render_x, g_render_y, 720, 720, scaled_buf);
             }
-            // 拡大済みの画像をDMA転送
-            M5.Display.pushImageDMA(g_render_x, g_render_y, 720, 720, scaled_buf);
+            if (present_mode != last_present_mode) {
+                const char *name = present_mode == 2 ? "direct"
+                                 : present_mode == 1 ? "staged"
+                                 : present_mode == 0 ? "cpu" : "unavailable";
+                printf("[R8T5] renderer: %s\n", name);
+                last_present_mode = present_mode;
+            }
         }
         render_idx = 1 - render_idx;
         xSemaphoreGive(doneSem);
@@ -58,6 +81,7 @@ void flipTask(void *pvParameters) {
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <driver/ppa.h>
+#include <esp_heap_caps.h>
 #include <lgfx/v1/platforms/esp32p4/Panel_DSI.hpp>
 
 // PPA (Pixel Processing Accelerator) parameters for Tab5
@@ -67,9 +91,11 @@ static uint32_t s_dsi_fb_bytes = 0;
 static int s_phys_w = 0;
 static int s_phys_h = 0;
 static bool s_ppa_ready = false;
+static bool s_ppa_direct_enabled = false;
 
 static void init_ppa_fast_present(void) {
     s_ppa_ready = false;
+    s_ppa_direct_enabled = false;
     s_dsi_fb = nullptr;
     auto *panel_dev = M5.Display.getPanel();
     if (!panel_dev) return;
@@ -79,10 +105,13 @@ static void init_ppa_fast_present(void) {
     const auto cfg = dsi->config();
     if (!detail.buffer || cfg.panel_width <= 0 || cfg.panel_height <= 0) return;
 
+    const uint64_t needed_bytes = (uint64_t)cfg.panel_width * cfg.panel_height * sizeof(uint16_t);
+    if (needed_bytes == 0 || needed_bytes > UINT32_MAX) return;
+
     s_dsi_fb = static_cast<uint16_t *>(detail.buffer);
     s_phys_w = cfg.panel_width;
     s_phys_h = cfg.panel_height;
-    s_dsi_fb_bytes = (uint32_t)s_phys_w * (uint32_t)s_phys_h * sizeof(uint16_t);
+    s_dsi_fb_bytes = (uint32_t)needed_bytes;
 
     ppa_client_config_t client_cfg = {};
     client_cfg.oper_type = PPA_OPERATION_SRM;
@@ -92,39 +121,87 @@ static void init_ppa_fast_present(void) {
         s_ppa_srm = nullptr;
         return;
     }
+
     s_ppa_ready = true;
+    s_ppa_direct_enabled =
+        ((uintptr_t)s_dsi_fb % 128) == 0 &&
+        (s_dsi_fb_bytes % 128) == 0;
 }
 
-static bool ppa_present_region_scaled(int x, int y, int dst_width, int dst_height, int src_width, int src_height, const uint16_t *frame_buffer) {
-    if (!s_ppa_ready || !s_ppa_srm || !s_dsi_fb || !frame_buffer) return false;
-    
-    const int logical_w = M5.Display.width();
-    const int logical_h = M5.Display.height();
-    const int out_x = logical_h - (y + dst_height);
-    const int out_y = x;
-    if (out_x < 0 || out_y < 0 || out_x + dst_height > s_phys_w || out_y + dst_width > s_phys_h) return false;
-
+static esp_err_t ppa_scale_rgb565(
+        const uint16_t *source, int src_width, int src_height,
+        uint16_t *destination, uint32_t destination_bytes,
+        int pic_width, int pic_height,
+        int offset_x, int offset_y,
+        float scale_x, float scale_y,
+        ppa_srm_rotation_angle_t rotation) {
     ppa_srm_oper_config_t op = {};
-    op.in.buffer = (const void *)frame_buffer;
+    op.in.buffer = source;
     op.in.pic_w = src_width;
     op.in.pic_h = src_height;
     op.in.block_w = src_width;
     op.in.block_h = src_height;
     op.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-    
-    op.out.buffer = (void *)s_dsi_fb;
-    op.out.pic_w = s_phys_w;
-    op.out.pic_h = s_phys_h;
-    op.out.block_offset_x = out_x;
-    op.out.block_offset_y = out_y;
+
+    op.out.buffer = destination;
+    op.out.buffer_size = destination_bytes;
+    op.out.pic_w = pic_width;
+    op.out.pic_h = pic_height;
+    op.out.block_offset_x = offset_x;
+    op.out.block_offset_y = offset_y;
     op.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
 
-    op.rotation_angle = PPA_SRM_ROTATION_ANGLE_270;
-    op.scale_x = (float)dst_height / src_height;
-    op.scale_y = (float)dst_width / src_width;
-
-    return ppa_do_scale_rotate_mirror(s_ppa_srm, &op) == ESP_OK;
+    op.rotation_angle = rotation;
+    op.scale_x = scale_x;
+    op.scale_y = scale_y;
+    op.mode = PPA_TRANS_MODE_BLOCKING;
+    return ppa_do_scale_rotate_mirror(s_ppa_srm, &op);
 }
+
+static bool ppa_present_region_scaled(int x, int y, int dst_width, int dst_height,
+                                      int src_width, int src_height, const uint16_t *frame_buffer) {
+    if (!s_ppa_ready || !s_ppa_direct_enabled || !s_dsi_fb || !frame_buffer) return false;
+
+    const int logical_h = M5.Display.height();
+    const int out_x = logical_h - (y + dst_height);
+    const int out_y = x;
+    if (out_x < 0 || out_y < 0 || out_x + dst_height > s_phys_w ||
+        out_y + dst_width > s_phys_h) {
+        s_ppa_direct_enabled = false;
+        return false;
+    }
+
+    esp_err_t result = ppa_scale_rgb565(
+        frame_buffer, src_width, src_height,
+        s_dsi_fb, s_dsi_fb_bytes, s_phys_w, s_phys_h,
+        out_x, out_y,
+        (float)dst_height / src_height, (float)dst_width / src_width,
+        PPA_SRM_ROTATION_ANGLE_270);
+
+    if (result != ESP_OK) {
+        printf("[R8T5] direct PPA failed: 0x%x\n", (unsigned)result);
+        s_ppa_direct_enabled = false;
+    }
+    return result == ESP_OK;
+}
+
+static bool ppa_present_staged_scaled(const uint16_t *frame_buffer, uint16_t *output_buffer) {
+    if (!s_ppa_ready || !frame_buffer || !output_buffer ||
+        ((uintptr_t)output_buffer % 128) != 0) return false;
+
+    esp_err_t result = ppa_scale_rgb565(
+        frame_buffer, 128, 128, output_buffer,
+        720 * 720 * sizeof(uint16_t), 720, 720, 0, 0,
+        720.0f / 128.0f, 720.0f / 128.0f,
+        PPA_SRM_ROTATION_ANGLE_0);
+
+    if (result != ESP_OK) {
+        printf("[R8T5] staged PPA failed: 0x%x\n", (unsigned)result);
+        s_ppa_ready = false;
+    }
+    return result == ESP_OK;
+}
+
 #include <Preferences.h>
 #include <math.h>
 // // #include <Bluepad32.h>
@@ -610,28 +687,97 @@ extern "C" void m5stack_resume_frame_buf(void)  {}
 // ---------------------------------------------------------------------------
 // レンダリングの超高速化と画面サイズの縮小
 // ---------------------------------------------------------------------------
+// Decode the PICO-8 8-bit display palette into the 32-color RGB565 table.
+// Bits 0..3 select a color; bit 7 selects the extended palette (16..31).
+static inline uint16_t r8t5_rgb565(uint8_t palette_color) {
+    return m_colors[((palette_color >> 3) & 0x10) | (palette_color & 0x0f)];
+}
+
+static inline void r8t5_transform_pixel(uint8_t mode, int ox, int oy, int &sx, int &sy) {
+    sx = ox; sy = oy;
+    switch (mode) {
+    case 1: sx = ox >> 1; break;
+    case 2: sy = oy >> 1; break;
+    case 3: sx = ox >> 1; sy = oy >> 1; break;
+    case 5: sx = (ox < 64) ? ox : 127 - ox; break;
+    case 6: sy = (oy < 64) ? oy : 127 - oy; break;
+    case 7: sx = (ox < 64) ? ox : 127 - ox;
+            sy = (oy < 64) ? oy : 127 - oy; break;
+    case 129: sx = 127 - ox; break;
+    case 130: sy = 127 - oy; break;
+    case 131: case 134: sx = 127 - ox; sy = 127 - oy; break;
+    case 133: sx = 127 - oy; sy = ox; break;
+    case 135: sx = oy; sy = 127 - ox; break;
+    }
+}
+
 extern "C" void p8_render()
 {
-    if (!m_memory || !line_buffer[0]) return;
-    uint8_t* vram = &m_memory[0x6000]; // VRAM starts at 0x6000
-
+    if (!m_memory || !line_buffer[0] || !doneSem || !flipSem) return;
     xSemaphoreTake(doneSem, portMAX_DELAY);
     M5.update(); // SAFE ZONE for I2C
 
-    // 出力先バッファのポインタ
     uint16_t* dest = line_buffer[render_idx];
+    if (!dest) { xSemaphoreGive(doneSem); return; }
 
-    // if文と割り算を排除した超高速ループ (2ピクセル同時処理)
-    // 128x128固定出力、PPAが720x720にハードウェアスケーリング
-    for (int y = 0; y < 128; y++) {
-        int y_offset = y * 64;
-        for (int x = 0; x < 64; x++) {
-            uint8_t pair = vram[y_offset + x];
-            *dest++ = m_colors[pair & 0x0F];
-            *dest++ = m_colors[pair >> 4];
+    const uint8_t* screen_pal = m_memory + MEMORY_PALETTES + PALTYPE_SCREEN * 16;
+    uint16_t screen_colors[16];
+    uint16_t secondary_colors[16];
+    for (int i = 0; i < 16; ++i) {
+        screen_colors[i] = r8t5_rgb565(screen_pal[i]);
+        secondary_colors[i] = r8t5_rgb565(m_memory[MEMORY_PALETTE_SECONDARY + i]);
+    }
+    unsigned screen_base = (unsigned)m_memory[MEMORY_SCREEN_PHYS] << 8;
+    if (screen_base > MEMORY_SIZE - MEMORY_SCREEN_SIZE)
+        screen_base = MEMORY_SCREEN;
+    const uint8_t *vram = m_memory + screen_base;
+    const uint8_t transform = m_memory[MEMORY_SCREEN_TRANSFORM];
+    const uint8_t hc_mode = m_memory[MEMORY_HIGH_COLOUR_MODE];
+
+    if (transform == 0 && hc_mode == 0) {
+        // Unchanged 128x128 fast path: palette is a 16-entry local lookup.
+        for (int y = 0; y < 128; ++y) {
+            const uint8_t *src = vram + y * 64;
+            for (int x = 0; x < 64; ++x) {
+                const uint8_t pair = src[x];
+                *dest++ = screen_colors[pair & 0x0f];
+                *dest++ = screen_colors[pair >> 4];
+            }
+        }
+    } else {
+        // PICO-8 screen transforms and secondary/high-color palette modes.
+        for (int y = 0; y < 128; ++y) {
+            for (int x = 0; x < 128; ++x) {
+                int sx, sy;
+                r8t5_transform_pixel(transform, x, y, sx, sy);
+                const unsigned offs = (unsigned)sy * 64 + ((unsigned)sx >> 1);
+                const uint8_t pair = vram[offs];
+                const uint8_t pix = (sx & 1) ? pair >> 4 : pair & 0x0f;
+                uint16_t col = screen_colors[pix];
+                if (hc_mode == 0x10) {
+                    const uint8_t bits = m_memory[0x5f70 + (sy >> 3)];
+                    if (bits & (1u << (sy & 7))) col = secondary_colors[pix];
+                } else if (hc_mode == 0x20) {
+                    // Match the SDL implementation's hidden right-side bitplane.
+                    const unsigned hidden = screen_base + (unsigned)sy * 64 + ((unsigned)(sx + 64) >> 1);
+                    if (hidden < MEMORY_SIZE) {
+                        const uint8_t h = m_memory[hidden];
+                        const uint8_t hp = ((sx + 64) & 1) ? h >> 4 : h & 0x0f;
+                        if (hp) col = secondary_colors[pix];
+                    }
+                } else if ((hc_mode & 0xf0) == 0x30) {
+                    const uint8_t pal_index = screen_pal[pix];
+                    if ((pal_index & 0x0f) == (hc_mode & 0x0f)) {
+                        int section = sy >> 3;
+                        const uint8_t bits = m_memory[0x5f70 + (sy >> 3)];
+                        if (bits & (1u << (sy & 7))) section = (section + 1) & 15;
+                        col = secondary_colors[section];
+                    }
+                }
+                *dest++ = col;
+            }
         }
     }
-
     xSemaphoreGive(flipSem);
 }
 
@@ -704,6 +850,64 @@ void load_selected_rom()
 // ---------------------------------------------------------------------------
 // Arduino entry points
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Tab5 3.5 mm headphone jack: mute only the external speaker amplifier.
+// M5Unified already drives the ES8388 DAC outputs for both speaker/headphones.
+// E1 PI4IOE5V6408 (0x43): P7=HP_DET (high when inserted), P1=SPK_EN.
+// Do not restart the codec, Speaker task or I2S stream when switching.
+// ---------------------------------------------------------------------------
+static void r8t5_update_headphone_route()
+{
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+    static bool have_sample = false;
+    static bool candidate_plugged = false;
+    static uint32_t candidate_since_ms = 0;
+    static uint32_t last_poll_ms = 0;
+
+    const uint32_t now = millis();
+    if (have_sample && (uint32_t)(now - last_poll_ms) < 75) return;
+    last_poll_ms = now;
+
+    constexpr uint8_t kExpander = 0x43;
+    constexpr uint8_t kInputStatus = 0x0f;
+    constexpr uint8_t kOutputState = 0x05;
+    constexpr uint8_t kHeadphonePin = 0x80;
+    constexpr uint8_t kSpeakerAmpPin = 0x02;
+    constexpr uint32_t kI2cHz = 400000;
+
+    uint8_t input_status = 0;
+    // An I2C failure must not be mistaken for headphone removal.
+    if (!M5.In_I2C.readRegister(kExpander, kInputStatus, &input_status, 1, kI2cHz))
+        return;
+
+    const bool plugged = (input_status & kHeadphonePin) != 0;
+    if (!have_sample || plugged != candidate_plugged) {
+        have_sample = true;
+        candidate_plugged = plugged;
+        candidate_since_ms = now;
+    }
+    if ((uint32_t)(now - candidate_since_ms) < 150) return;
+
+    // M5Unified may re-enable SPK_EN on starting a new sound. Compare
+    // the real output latch and enforce headphone-only routing if needed.
+    uint8_t output_state = 0;
+    if (!M5.In_I2C.readRegister(kExpander, kOutputState, &output_state, 1, kI2cHz))
+        return;
+
+    const bool speaker_on = (output_state & kSpeakerAmpPin) != 0;
+    const bool want_speaker = !plugged && M5.Speaker.isEnabled();
+    if (speaker_on == want_speaker) return;
+
+    const bool ok = want_speaker
+        ? M5.In_I2C.bitOn(kExpander, kOutputState, kSpeakerAmpPin, kI2cHz)
+        : M5.In_I2C.bitOff(kExpander, kOutputState, kSpeakerAmpPin, kI2cHz);
+    if (ok)
+        Serial.printf("[R8T5] 3.5mm %s; built-in speaker %s\n",
+                      plugged ? "connected" : "disconnected",
+                      want_speaker ? "ON" : "OFF");
+#endif
+}
 
 void setup()
 {
@@ -811,6 +1015,8 @@ void process_volume_controls(uint16_t current_btn);
 
 void loop()
 {
+    r8t5_update_headphone_route();
+
     if (g_emulator_init_failed) {
         static bool shown = false;
         if (!shown) {
