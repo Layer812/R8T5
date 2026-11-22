@@ -355,7 +355,9 @@ static int pico8_split(lua_State *l) {
     /* Do not modify lua_tolstring()'s interned bytes, not even briefly:
      * lua_pushlstring() may allocate/GC while the original string is
      * temporarily changed, corrupting Lua string-table lookups. */
-    if (lua_isnumber(l, 2)) {
+    /* lua_isnumber(nil) is true in this PICO-8-compatible VM; only an actual
+     * number requests fixed-width chunks. Omitted separator means comma. */
+    if (lua_type(l, 2) == LUA_TNUMBER) {
         size = fix32_to_int(lua_tonumber(l, 2));
         if (size <= 0)
             size = 1;
