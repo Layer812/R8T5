@@ -46,10 +46,10 @@ RONTO8は、[**M5Stack Tab5**](https://docs.m5stack.com/ja/core/Tab5) 専用に�
 
 ### Via [M5Burner](https://docs.m5stack.com/en/uiflow/m5burner/intro) (Recommended)
 You can easily install RONTO8 using [M5Burner](https://docs.m5stack.com/en/uiflow/m5burner/intro) with the following share code:
-- **Share Code**: `KFypzWRMDrP9nqrh`
+- **Share Code**: `1cfSQo0uWeTa33oH`
 
 [M5Burner](https://docs.m5stack.com/en/uiflow/m5burner/intro)のシェアコード検索から簡単にインストールできます：
-- **シェアコード**: `KFypzWRMDrP9nqrh`
+- **シェアコード**: `1cfSQo0uWeTa33oH`
 
 ### Building from Source / ソースからビルドする場合
 
