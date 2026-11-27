@@ -267,7 +267,7 @@ static bool ppa_present_crisp_tiles(const uint16_t *source, uint16_t *scaled)
     if (s_phys_w != 720 || s_phys_h != 1280 || phys_w != 720 ||
         base_x < 0 || base_y < 0 || base_x + 720 > M5.Display.width() ||
         base_y + 720 > M5.Display.height()) {
-        printf("[R8T5] crisp geometry unsupported (%d x %d)\\n", s_phys_w, s_phys_h);
+        printf("[R8T5] crisp geometry unsupported (%d x %d)\n", s_phys_w, s_phys_h);
         s_crisp_bad_geometry = true;
         s_crisp_previous_valid = false;
         return false;
@@ -335,13 +335,13 @@ static bool ppa_present_crisp_tiles(const uint16_t *source, uint16_t *scaled)
                 s_crisp_previous_valid = false;
                 if (err == ESP_ERR_INVALID_ARG) {
                     s_crisp_bad_geometry = true;
-                    printf("[R8T5] crisp config error 0x%x tile=%d,%d; CPU fallback\\n",
+                    printf("[R8T5] crisp config error 0x%x tile=%d,%d; CPU fallback\n",
                            (unsigned)err, tile_x, tile_y);
                 } else {
                     if (s_crisp_consecutive_errors < 255) ++s_crisp_consecutive_errors;
                     const uint32_t cooldown = s_crisp_consecutive_errors >= 3 ? 1000u : 50u;
                     s_crisp_retry_after_ms = millis() + cooldown;
-                    printf("[R8T5] crisp transient error 0x%x retry=%u cooldown=%ums\\n",
+                    printf("[R8T5] crisp transient error 0x%x retry=%u cooldown=%ums\n",
                            (unsigned)err, (unsigned)s_crisp_consecutive_errors,
                            (unsigned)cooldown);
                 }
@@ -351,7 +351,7 @@ static bool ppa_present_crisp_tiles(const uint16_t *source, uint16_t *scaled)
     }
 
     if (s_crisp_consecutive_errors) {
-        printf("[R8T5] crisp recovered after %u errors\\n",
+        printf("[R8T5] crisp recovered after %u errors\n",
                (unsigned)s_crisp_consecutive_errors);
         s_crisp_consecutive_errors = 0;
     }
@@ -359,7 +359,7 @@ static bool ppa_present_crisp_tiles(const uint16_t *source, uint16_t *scaled)
     s_crisp_previous_valid = true;
     static uint32_t frame_counter = 0;
     if ((++frame_counter % 120u) == 0u) {
-        printf("[R8T5] crisp tiles=%d/16 present_us=%lu\\n",
+        printf("[R8T5] crisp tiles=%d/16 present_us=%lu\n",
                dirty_count, (unsigned long)(micros() - started));
     }
     return true;
@@ -486,6 +486,7 @@ static void scan_browser_directory(const String& path)
 
 static void draw_browser()
 {
+    s_crisp_invalidate.store(true);
     uint16_t brand_color = M5.Display.color565(255, 120, 0); // Orange
     uint16_t bg_gray = M5.Display.color565(30, 30, 30);
     uint16_t list_bg = M5.Display.color565(20, 20, 20);
@@ -951,6 +952,7 @@ extern "C" void p8_render()
 enum SplashAction { SPLASH_START, SPLASH_BT };
 
 SplashAction show_ronto8_splash() {
+    s_crisp_invalidate.store(true);
     uint16_t brand_color = M5.Display.color565(255, 120, 0); // Orange
     M5.Display.fillScreen(brand_color);
     
@@ -988,6 +990,7 @@ String get_browser_name(int index)
 
 void load_selected_rom()
 {
+    s_crisp_invalidate.store(true);
     String filename = get_browser_name(g_browser_cursor);
     String fullpath = g_browser_path + filename;
 
