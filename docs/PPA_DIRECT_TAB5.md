@@ -86,7 +86,7 @@ Driver validation: [`esp-idf` v5.5.4 `ppa_srm.c`, `ppa_do_scale_rotate_mirror()`
 
 **Important limitation of the v0.65 direct renderer:** PPA SRM with fractional scale (here 5.625x) **interpolates pixels**, so it can blend edges and produce colors not present in the original PICO-8 image. In [the independent retro-go test report](https://github.com/Layer812/R8T5/issues/1#issuecomment-7135872435), 104 of 144 sample pixels differed from nearest-neighbour; the reporter obtained byte-identical output using **CPU nearest-neighbour upscale + PPA at 1:1 to rotate/transfer**. Their reported per-block performance applies to their workload/hardware, **not automatically to R8T5**.
 
-A [separate experimental R8T5 implementation](PPA_CRISP_EXPERIMENT.md) (development branch, **not public v0.65**) uses dirty 32x32 source tiles, CPU nearest-neighbour to 180x180 and PPA 1:1 rotate into the live DSI buffer. Hardware behavior and speed are pending actual Tab5 testing.
+A [separate experimental R8T5 implementation](https://github.com/Layer812/R8T5/blob/work/r8t5-ppa-crisp-dirty-retry-20261128/docs/PPA_CRISP_EXPERIMENT.md) (development branch, **not public v0.65**) uses dirty 32x32 source tiles, CPU nearest-neighbour to 180x180 and PPA 1:1 rotate into the live DSI buffer. Hardware behavior and speed are pending actual Tab5 testing.
 
 ## Runtime behavior and fallback
 
