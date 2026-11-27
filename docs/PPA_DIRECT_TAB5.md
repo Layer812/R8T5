@@ -34,6 +34,8 @@ ESP_ERROR_CHECK(ppa_register_client(&client_cfg, &s_ppa_srm));
 
 R8T5 uses the returned client handle with **one blocking SRM operation per frame**. The actual application checks for errors and falls back rather than aborting.
 
+**Burst default:** Espressif's `ppa_core.c` sets `client->data_burst_length` to `PPA_DATA_BURST_LENGTH_128` when the config field is zero. Thus the explicit `data_burst_length = PPA_DATA_BURST_LENGTH_128` above has no extra tuning effect and is optional.
+
 ## SRM operation
 
 Below is the essential configuration for the tested **128 × 128 to centered 720 × 720** image. The framebuffer layout and offsets are specific to Tab5's panel rotation.
@@ -78,11 +80,17 @@ Check the following before experimenting with other alignments or panels:
 4. Set physical `op.out.pic_w/pic_h`, not logical landscape dimensions, and ensure the scaled 270-degree region and offsets fit.
 5. Ensure `ppa_register_client()` succeeds and `op.mode = PPA_TRANS_MODE_BLOCKING`.
 
-Driver validation: [`esp-idf` v5.5.4 `ppa_srm.c`, `ppa_do_scale_rotate_mirror()`](https://github.com/espressif/esp-idf/blob/v5.5.4/components/esp_driver_ppa/src/ppa_srm.c#L187-L240). The exact reason for a different project's `0x102` requires its own driver log; `buffer_size` is a **possible**, not confirmed, cause.
+Driver validation: [`esp-idf` v5.5.4 `ppa_srm.c`, `ppa_do_scale_rotate_mirror()`](https://github.com/espressif/esp-idf/blob/v5.5.4/components/esp_driver_ppa/src/ppa_srm.c#L187-L240). The alignment check precedes the *declared output picture length* check. In [Issue #1's verified follow-up](https://github.com/Layer812/R8T5/issues/1#issuecomment-7135872435), the reporter confirmed that their `0x102` was caused by omitting `op.out.buffer_size`. This diagnosis was confirmed for their setup, not for all `0x102` errors.
+
+## Pixel-art fidelity: interpolating scale is not nearest-neighbour
+
+**Important limitation of the v0.65 direct renderer:** PPA SRM with fractional scale (here 5.625x) **interpolates pixels**, so it can blend edges and produce colors not present in the original PICO-8 image. In [the independent retro-go test report](https://github.com/Layer812/R8T5/issues/1#issuecomment-7135872435), 104 of 144 sample pixels differed from nearest-neighbour; the reporter obtained byte-identical output using **CPU nearest-neighbour upscale + PPA at 1:1 to rotate/transfer**. Their reported per-block performance applies to their workload/hardware, **not automatically to R8T5**.
+
+A [separate experimental R8T5 implementation](PPA_CRISP_EXPERIMENT.md) (development branch, **not public v0.65**) uses dirty 32x32 source tiles, CPU nearest-neighbour to 180x180 and PPA 1:1 rotate into the live DSI buffer. Hardware behavior and speed are pending actual Tab5 testing.
 
 ## Runtime behavior and fallback
 
-R8T5's present task runs `M5.Display.waitDMA()` and tries direct SRM. If direct SRM fails, R8T5 disables direct mode for that session and falls back to a staged PPA operation or CPU scaling before `M5.Display.pushImageDMA()`.
+The published v0.65 present task calls `M5.Display.waitDMA()`, then attempts direct SRM. On the first direct failure it disables direct mode for the remainder of the session, falling back to staged PPA/CPU as available. The issue reporter also observed long transient latency spikes under memory contention; **one failure may not be a permanent configuration defect**. An automatic retry/cooldown experiment is included in the separate development branch; the published v0.65 has not been modified.
 
 Typical log on a successful direct frame:
 
