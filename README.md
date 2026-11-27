@@ -31,6 +31,7 @@ RONTO8は、[**M5Stack Tab5**](https://docs.m5stack.com/ja/core/Tab5) 専用に�
 - **Working source / 実装コード**: [`src/m5stack_main.cpp`](src/m5stack_main.cpp), functions `init_ppa_fast_present()`, `ppa_scale_rgb565()`, `ppa_present_region_scaled()`, `flipTask()`.
 - **Detailed configuration / 詳細仕様**: [`docs/PPA_DIRECT_TAB5.md`](docs/PPA_DIRECT_TAB5.md) — framebuffer alignment, `op.out.buffer_size`, rotation/offsets, and `ESP_ERR_INVALID_ARG (0x102)` troubleshooting.
 - If the direct operation is unavailable or fails, the application falls back to staged PPA or CPU scaling. / PPA DIRECTが使用できない場合は段階的PPAまたはCPU描画にフォールバックします。
+- **Pixel-art caveat / 画質上の注意**: v0.65's 5.625× PPA scaling **interpolates** RGB565 and may soften PICO-8 pixel edges. The [Issue #1 follow-up](https://github.com/Layer812/R8T5/issues/1#issuecomment-7135872435) confirmed this independently. A [nearest-neighbour + PPA 1:1 experimental branch](https://github.com/Layer812/R8T5/pull/10) is awaiting Tab5 hardware checks; this is **not yet** the public v0.65 build. / v0.65のPPA拡大は補間されるためドット境界がぼやける場合があります。ドット厳密表示版は実機検証中です。
 
 ---
 ## 🎮 Controls / 操作方法
