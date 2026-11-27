@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <atomic>
 /*
  * Created by Layer8
  * M5Stack Tab5 entry point and hardware abstraction layer for RONTO8.
@@ -15,6 +16,13 @@ int g_render_size = 128; // PICO-8 解像度 (PPAハードウェアスケーリ�
 int g_render_x    = (1280 - 720) / 2; // PPA出力の水平位置 (Tab5用)
 int g_render_y    = 0;   // PPA出力の Y オフセット
 
+// Experimental PICO-8 pixel-perfect path. Disable with
+// -D R8T5_EXPERIMENTAL_CRISP_PPA=0 to compare the original smooth PPA.
+#ifndef R8T5_EXPERIMENTAL_CRISP_PPA
+#define R8T5_EXPERIMENTAL_CRISP_PPA 1
+#endif
+static std::atomic<bool> s_crisp_invalidate{true};
+
 // PPA前方宣言
 static bool ppa_present_region_scaled(int x, int y, int dst_width, int dst_height, int src_width, int src_height, const uint16_t *frame_buffer);
 
@@ -23,6 +31,7 @@ static uint16_t* scaled_buf = nullptr;
 static int src_idx[720];
 
 static bool ppa_present_staged_scaled(const uint16_t *frame_buffer, uint16_t *output_buffer);
+static bool ppa_present_crisp_tiles(const uint16_t *frame_buffer, uint16_t *output_buffer);
 
 void flipTask(void *pvParameters) {
     for (int i = 0; i < 720; ++i) {
@@ -44,6 +53,25 @@ void flipTask(void *pvParameters) {
             M5.Display.waitDMA();
 
             int present_mode = -1;
+#if R8T5_EXPERIMENTAL_CRISP_PPA
+            if (scaled_buf && ppa_present_crisp_tiles(src, scaled_buf)) {
+                present_mode = 3; // Crisp nearest-neighbour + PPA 1:1 rotation
+            } else if (scaled_buf) {
+                // When SRM fails, always fall back to a FULL nearest-neighbour
+                // frame. This also repairs any partial dirty-tile updates.
+                for (int y = 0; y < 720; ++y) {
+                    const uint16_t *src_row = &src[src_idx[y] * 128];
+                    uint16_t *dst_row = &scaled_buf[y * 720];
+                    for (int x = 0; x < 720; ++x)
+                        dst_row[x] = src_row[src_idx[x]];
+                }
+                present_mode = 0;
+                M5.Display.pushImageDMA(g_render_x, g_render_y, 720, 720, scaled_buf);
+            } else if (ppa_present_region_scaled(g_render_x, g_render_y, 720, 720, 128, 128, src)) {
+                // Emergency memory fallback only: PPA interpolation is NOT pixel-perfect.
+                present_mode = 2;
+            }
+#else
             if (ppa_present_region_scaled(g_render_x, g_render_y, 720, 720, 128, 128, src)) {
                 present_mode = 2;
             } else if (scaled_buf) {
@@ -61,8 +89,10 @@ void flipTask(void *pvParameters) {
                 }
                 M5.Display.pushImageDMA(g_render_x, g_render_y, 720, 720, scaled_buf);
             }
+#endif
             if (present_mode != last_present_mode) {
-                const char *name = present_mode == 2 ? "direct"
+                const char *name = present_mode == 3 ? "crisp-1to1"
+                                 : present_mode == 2 ? "direct"
                                  : present_mode == 1 ? "staged"
                                  : present_mode == 0 ? "cpu" : "unavailable";
                 printf("[R8T5] renderer: %s\n", name);
@@ -116,7 +146,7 @@ static void init_ppa_fast_present(void) {
     ppa_client_config_t client_cfg = {};
     client_cfg.oper_type = PPA_OPERATION_SRM;
     client_cfg.max_pending_trans_num = 1;
-    client_cfg.data_burst_length = PPA_DATA_BURST_LENGTH_128;
+    // 128 is already the IDF default. Not a performance tuning switch.
     if (ppa_register_client(&client_cfg, &s_ppa_srm) != ESP_OK) {
         s_ppa_srm = nullptr;
         return;
@@ -180,7 +210,10 @@ static bool ppa_present_region_scaled(int x, int y, int dst_width, int dst_heigh
 
     if (result != ESP_OK) {
         printf("[R8T5] direct PPA failed: 0x%x\n", (unsigned)result);
-        s_ppa_direct_enabled = false;
+        // 0x102 is a persistent configuration/geometry failure, unlike
+        // temporary bus-contention errors which should be retried next frame.
+        if (result == ESP_ERR_INVALID_ARG)
+            s_ppa_direct_enabled = false;
     }
     return result == ESP_OK;
 }
@@ -197,9 +230,139 @@ static bool ppa_present_staged_scaled(const uint16_t *frame_buffer, uint16_t *ou
 
     if (result != ESP_OK) {
         printf("[R8T5] staged PPA failed: 0x%x\n", (unsigned)result);
-        s_ppa_ready = false;
+        if (result == ESP_ERR_INVALID_ARG)
+            s_ppa_ready = false;
     }
     return result == ESP_OK;
+}
+
+// 128x128 PICO-8 nearest-neighbour upscale to 720x720 is exactly tiled:
+// 32x32 source pixels -> 180x180 output pixels, i.e. four by four tiles.
+// The PPA only performs 1:1 SRM rotation, never fractional scaling.
+static uint16_t s_crisp_previous[128 * 128];
+static bool s_crisp_previous_valid = false;
+static bool s_crisp_bad_geometry = false;
+static uint8_t s_crisp_consecutive_errors = 0;
+static uint32_t s_crisp_retry_after_ms = 0;
+
+static bool ppa_present_crisp_tiles(const uint16_t *source, uint16_t *scaled)
+{
+    constexpr int kSourceTile = 32;
+    constexpr int kOutputTile = 180;
+    constexpr int kTiles = 4;
+    if (!source || !scaled || !s_ppa_ready || !s_ppa_direct_enabled ||
+        !s_dsi_fb || s_crisp_bad_geometry || ((uintptr_t)scaled % 128) != 0) {
+        s_crisp_previous_valid = false;
+        return false;
+    }
+    const uint32_t now = millis();
+    if (s_crisp_consecutive_errors && (int32_t)(now - s_crisp_retry_after_ms) < 0) {
+        s_crisp_previous_valid = false;
+        return false;
+    }
+
+    const int phys_w = M5.Display.height();
+    const int base_y = g_render_y;
+    const int base_x = g_render_x;
+    if (s_phys_w != 720 || s_phys_h != 1280 || phys_w != 720 ||
+        base_x < 0 || base_y < 0 || base_x + 720 > M5.Display.width() ||
+        base_y + 720 > M5.Display.height()) {
+        printf("[R8T5] crisp geometry unsupported (%d x %d)\\n", s_phys_w, s_phys_h);
+        s_crisp_bad_geometry = true;
+        s_crisp_previous_valid = false;
+        return false;
+    }
+
+    const bool invalidated = s_crisp_invalidate.exchange(false);
+    const bool redraw_all = !s_crisp_previous_valid || invalidated;
+    const uint32_t started = micros();
+    int dirty_count = 0;
+    for (int tile_y = 0; tile_y < kTiles; ++tile_y) {
+        for (int tile_x = 0; tile_x < kTiles; ++tile_x) {
+            const int sx0 = tile_x * kSourceTile;
+            const int sy0 = tile_y * kSourceTile;
+            bool dirty = redraw_all;
+            if (!dirty) {
+                for (int sy = 0; sy < kSourceTile; ++sy) {
+                    const int idx = (sy0 + sy) * 128 + sx0;
+                    if (memcmp(source + idx, s_crisp_previous + idx,
+                               kSourceTile * sizeof(uint16_t)) != 0) {
+                        dirty = true;
+                        break;
+                    }
+                }
+            }
+            if (!dirty) continue;
+            ++dirty_count;
+
+            // CPU-nearest-neighbour for exactly this tile; other tiles in
+            // the persistent full-size buffer retain their previous pixels.
+            for (int py = tile_y * kOutputTile; py < (tile_y + 1) * kOutputTile; ++py) {
+                const uint16_t *src_row = source + src_idx[py] * 128;
+                uint16_t *dst_row = scaled + py * 720;
+                for (int px = tile_x * kOutputTile; px < (tile_x + 1) * kOutputTile; ++px)
+                    dst_row[px] = src_row[src_idx[px]];
+            }
+
+            // 270-degree rotation maps logical x/y to physical Y/X.
+            // Source is a 180x180 subrectangle of the 720x720 scaled image.
+            ppa_srm_oper_config_t op = {};
+            op.in.buffer = scaled;
+            op.in.pic_w = 720;
+            op.in.pic_h = 720;
+            op.in.block_offset_x = tile_x * kOutputTile;
+            op.in.block_offset_y = tile_y * kOutputTile;
+            op.in.block_w = kOutputTile;
+            op.in.block_h = kOutputTile;
+            op.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+
+            op.out.buffer = s_dsi_fb;
+            op.out.buffer_size = s_dsi_fb_bytes;
+            op.out.pic_w = s_phys_w;
+            op.out.pic_h = s_phys_h;
+            op.out.block_offset_x = phys_w - (base_y + (tile_y + 1) * kOutputTile);
+            op.out.block_offset_y = base_x + tile_x * kOutputTile;
+            op.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+
+            op.rotation_angle = PPA_SRM_ROTATION_ANGLE_270;
+            op.scale_x = 1.0f;
+            op.scale_y = 1.0f;
+            op.mode = PPA_TRANS_MODE_BLOCKING;
+            const esp_err_t err = ppa_do_scale_rotate_mirror(s_ppa_srm, &op);
+            if (err != ESP_OK) {
+                // A transient stall must not permanently kill the fast path.
+                // A full CPU fallback repairs even partially written frames.
+                s_crisp_previous_valid = false;
+                if (err == ESP_ERR_INVALID_ARG) {
+                    s_crisp_bad_geometry = true;
+                    printf("[R8T5] crisp config error 0x%x tile=%d,%d; CPU fallback\\n",
+                           (unsigned)err, tile_x, tile_y);
+                } else {
+                    if (s_crisp_consecutive_errors < 255) ++s_crisp_consecutive_errors;
+                    const uint32_t cooldown = s_crisp_consecutive_errors >= 3 ? 1000u : 50u;
+                    s_crisp_retry_after_ms = millis() + cooldown;
+                    printf("[R8T5] crisp transient error 0x%x retry=%u cooldown=%ums\\n",
+                           (unsigned)err, (unsigned)s_crisp_consecutive_errors,
+                           (unsigned)cooldown);
+                }
+                return false;
+            }
+        }
+    }
+
+    if (s_crisp_consecutive_errors) {
+        printf("[R8T5] crisp recovered after %u errors\\n",
+               (unsigned)s_crisp_consecutive_errors);
+        s_crisp_consecutive_errors = 0;
+    }
+    memcpy(s_crisp_previous, source, sizeof(s_crisp_previous));
+    s_crisp_previous_valid = true;
+    static uint32_t frame_counter = 0;
+    if ((++frame_counter % 120u) == 0u) {
+        printf("[R8T5] crisp tiles=%d/16 present_us=%lu\\n",
+               dirty_count, (unsigned long)(micros() - started));
+    }
+    return true;
 }
 
 #include <Preferences.h>
